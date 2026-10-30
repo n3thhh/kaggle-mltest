@@ -26,6 +26,26 @@ import sys
 from .swiglu import patch_qwen2_mlp
 
 
+def since_start():
+    """Seconds since this process started (for the timeline lines in the log)."""
+    try:
+        import os
+
+        ticks = os.sysconf("SC_CLK_TCK")
+        start = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19]) / ticks
+        boot = next(float(line.split()[1]) for line in open("/proc/stat")
+                    if line.startswith("btime"))
+        import time
+
+        return time.time() - boot - start
+    except Exception:  # noqa: BLE001
+        return float("nan")
+
+
+def mark(what):
+    print(f"[solution] t={since_start():6.2f} s  {what}", file=sys.stderr, flush=True)
+
+
 def _try(name, patch):
     try:
         patch()
@@ -34,6 +54,7 @@ def _try(name, patch):
 
 
 def apply():
+    mark("apply() starts")
     from .warmup import start
 
     _try("kernel warm-up", start)  # first: our kernels compile while everything else loads
@@ -67,3 +88,30 @@ def apply():
         _try("4-bit weights in pinned host memory", offload.patch_quantize)
         _try("loading without GPU pre-allocation, embedding to host memory",
              offload.patch_loading)
+    _try("timeline", _timeline)
+    mark("apply() done")
+
+
+def _timeline():
+    """Marks in the log at the main stages of the run (load, trainer, training, exit)."""
+    import atexit
+
+    import transformers
+
+    atexit.register(mark, "exit")
+    trainer_cls = transformers.Trainer
+    init, train = trainer_cls.__init__, trainer_cls.train
+
+    def traced_init(self, *args, **kwargs):
+        mark("trainer: init starts")
+        init(self, *args, **kwargs)
+        mark("trainer: init done")
+
+    def traced_train(self, *args, **kwargs):
+        mark("trainer: train() starts")
+        try:
+            return train(self, *args, **kwargs)
+        finally:
+            mark("trainer: train() done")
+
+    trainer_cls.__init__, trainer_cls.train = traced_init, traced_train

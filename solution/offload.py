@@ -142,6 +142,15 @@ def patch_loading():
     load = cls.from_pretrained.__func__
 
     def from_pretrained(klass, *args, **kwargs):
+        from . import mark
+
+        mark(f"from_pretrained({klass.__name__}) starts")
+        try:
+            return _from_pretrained(klass, *args, **kwargs)
+        finally:
+            mark(f"from_pretrained({klass.__name__}) done")
+
+    def _from_pretrained(klass, *args, **kwargs):
         if not active["on"]:
             return load(klass, *args, **kwargs)
         try:
@@ -217,12 +226,14 @@ class ActivationStore:
         self.h2d = torch.cuda.Stream(device)
         self.arena = None
         self.pending = {}
+        self.in_flight = []
 
     def begin_step(self, nbytes):
         if self.arena is None or self.arena.numel() < nbytes:
             self.arena = torch.empty(max(nbytes, 512 * 2**20), dtype=torch.uint8,
                                      pin_memory=True)
         self.used = 0
+        self.in_flight = []
         # the previous step's last host-to-device reads must finish before this step writes
         self.d2h.wait_stream(self.h2d)
 
@@ -244,6 +255,12 @@ class ActivationStore:
                 hosts.append(host)
         done = torch.cuda.Event()
         done.record(self.d2h)
+        # At most two layers' copies in flight: the GPU memory of a tensor being copied is
+        # held until its copy ends, so a backlog would raise the memory peak. Waiting here
+        # (CPU side) costs nothing while the copies keep pace with the layers.
+        self.in_flight.append(done)
+        while len(self.in_flight) > 2:
+            self.in_flight.pop(0).synchronize()
         return {"hosts": hosts, "d2h": done, "gpu": None, "h2d": None}
 
     def prefetch(self, handle):

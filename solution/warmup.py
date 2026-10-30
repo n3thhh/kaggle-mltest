@@ -121,8 +121,8 @@ def _compile_all():
 
         store = offload.activation_store(dev)
         if store is not None and store.arena is None:
-            store.arena = torch.empty(28 * (layer.host_bytes_per_token_layer(INTER) * 2048 +
-                                            8 * 512) + 2**20, dtype=torch.uint8, pin_memory=True)
+            store.arena = torch.empty(layer.host_bytes(2048, 28, INTER), dtype=torch.uint8,
+                                      pin_memory=True)
 
     jobs.append(host_memory)
     import time

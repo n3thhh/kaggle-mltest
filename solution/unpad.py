@@ -309,9 +309,8 @@ def patch_qwen2_model():
                     store = None
                 ctx.handles, ctx.mlp_calls = {}, 0
                 if store is not None:
-                    store.begin_step(len(layers) * (
-                        fused.host_bytes_per_token_layer(cfg.intermediate_size) * n_real +
-                        8 * 512) + 2**20)
+                    store.begin_step(fused.host_bytes(n_real, len(layers),
+                                                      cfg.intermediate_size))
                 recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
                                                           cfg.intermediate_size,
                                                           offloaded=store is not None)

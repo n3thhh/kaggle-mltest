@@ -566,7 +566,8 @@ class FusedDecoderLayer(torch.autograd.Function):
         # gate|up (35 KB per token) is not kept on the GPU in "recompute" layers: with the
         # activation store it goes to host memory with the rest (the copy engines are idle
         # enough), otherwise the backward pass recomputes it (one more large GEMM).
-        gu_host = spec.recompute_mlp and spec.store is not None and not spec.last and OFFLOAD_MLP
+        gu_host = spec.recompute_mlp and spec.store is not None and not spec.last and \
+            mlp_to_host(spec.index)
         if spec.recompute_mlp and not gu_host:
             del gu
             gu = None
@@ -716,13 +717,27 @@ class FusedDecoderLayer(torch.autograd.Function):
 ACT_BUDGET_MB = 1300.0
 OFFLOAD_ACT_BUDGET_MB = 0.0
 KEPT_BYTES_PER_TOKEN_LAYER = 9 * 1024 + 128
-OFFLOAD_MLP = __import__("os").environ.get("SOUP_SOLUTION_OFFLOAD_MLP", "1") == "1"
+# gate|up goes to host memory in two layers out of three and is recomputed in the third: that
+# keeps the copy engines (12 GB/s each way on the T4's PCIe) about as busy as the GEMMs, so
+# neither waits for the other. 0: always recompute, 1: always to host.
+MLP_HOST_PERIOD = int(__import__("os").environ.get("SOUP_SOLUTION_MLP_HOST_PERIOD", "3"))
 
 
-def host_bytes_per_token_layer(inter):
-    """Pinned host memory one layer's saved tensors take per token (x, attention's output and,
-    with OFFLOAD_MLP, gate|up)."""
-    return KEPT_BYTES_PER_TOKEN_LAYER + (4 * inter if OFFLOAD_MLP else 0)
+def mlp_to_host(index):
+    if MLP_HOST_PERIOD <= 0:
+        return False
+    return MLP_HOST_PERIOD == 1 or index % MLP_HOST_PERIOD != MLP_HOST_PERIOD - 1
+
+
+def host_bytes(n_tokens, n_layers, inter):
+    """Pinned host memory the saved tensors of one step take (every layer but the last: x and
+    attention's output; gate|up where mlp_to_host), with the 512-byte alignment of each."""
+    total = 2**20
+    for index in range(n_layers - 1):
+        total += KEPT_BYTES_PER_TOKEN_LAYER * n_tokens + 3 * 512
+        if mlp_to_host(index):
+            total += 4 * inter * n_tokens
+    return total
 
 
 def mlp_layers_to_recompute(n_tokens, n_layers, inter, offloaded=False):
@@ -1006,8 +1021,7 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
                 _Attention.mode = mode
                 sub.handles = {}
                 if keep_host:
-                    store.begin_step(host_bytes_per_token_layer(
-                        layer.mlp.config.intermediate_size) * m + 2**20)
+                    store.begin_step(host_bytes(m, 2, layer.mlp.config.intermediate_size))
                 torch.cuda.set_rng_state(state, device)
                 out = run_layer(layer, xin, sub, cos, sin, True, index=0,
                                 weights=weights if stream else None,
