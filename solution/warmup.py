@@ -22,7 +22,7 @@ HEADS, KV, HEAD_DIM = 12, 2, 128
 def _compile_all():
     import torch
 
-    from . import fused_ce, head_stream, layer, rmsnorm
+    from . import fused_ce, head_stream, layer, offload, rmsnorm
 
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
@@ -73,9 +73,6 @@ def _compile_all():
             t(HEAD_DIM, f32), t(HEADS * HEAD_DIM, f16), t(HEADS * HEAD_DIM, f16),
             t(HEADS * HEAD_DIM, f16), t(KV * HEAD_DIM, f16), t(KV * HEAD_DIM, f16), 2.0, 2.0,
             N_HEADS=HEADS, N_KV=KV, HEAD_DIM=HEAD_DIM),
-        lambda: layer.kv_expand_kernel[(1, HEADS)](
-            t(KV * HEAD_DIM, f16), t(KV * HEAD_DIM, f16), t(HEADS * HEAD_DIM, f16),
-            t(HEADS * HEAD_DIM, f16), N_HEADS=HEADS, N_KV=KV, HEAD_DIM=HEAD_DIM),
         lambda: layer.qkv_rope_bwd_kernel[(1, HEADS + KV)](
             t(HEADS * HEAD_DIM, f16), t(HEADS * HEAD_DIM, f16), t(HEADS * HEAD_DIM, f16),
             t(HEAD_DIM, f32), t(HEAD_DIM, f32), t(QKV, f16), N_HEADS=HEADS, N_KV=KV,
@@ -85,7 +82,7 @@ def _compile_all():
         lambda: layer.gate_up_act_bwd_kernel[(1, 1)](
             t(I, f16), t(2 * I, f16), t(2 * I, f16), I, BLOCK=layer.ACT_BLOCK),
         # the head and loss (fused_ce.py) and the final norm (rmsnorm.py)
-        lambda: fused_ce.ce_row_stats_kernel.warmup(
+        lambda: None if offload.ENABLED and offload.HEAD else fused_ce.ce_row_stats_kernel.warmup(
             t(VOCAB, f16), VOCAB, 0, t(1, i64), t(1, f32), t(1, f32),
             t(1, torch.int32), fused_ce.GRAD_SCALE, N_VOCAB=VOCAB, BLOCK_V=fused_ce.VOCAB_BLOCK,
             WRITE_GRAD=True, num_warps=8, grid=(1,)),
@@ -155,3 +152,10 @@ def wait():
         t0 = time.perf_counter()
         _THREAD.join()
         TIMES["waited"] = time.perf_counter() - t0
+        import sys
+
+        start, done = TIMES.get("start"), TIMES.get("done")
+        print(f"[solution] kernel warm-up: {done - start:.2f} s in the background, the first step "
+              f"waited {TIMES['waited']:.2f} s, errors: {TIMES.get('errors', [])}"
+              if start is not None and done is not None else
+              f"[solution] kernel warm-up: unfinished ({TIMES})", file=sys.stderr)

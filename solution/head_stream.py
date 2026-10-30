@@ -256,13 +256,26 @@ class materialized:
 VERIFIED = {"done": False}
 
 
+def _plain_head(h, w, targets, k, grad_scale):
+    """The same quantities in plain fp32 PyTorch (the yardstick of verify())."""
+    logits = h.float() @ w.float().t()
+    lse = torch.logsumexp(logits, -1)
+    p = torch.softmax(logits, -1)
+    entropy = lse - (p * logits).sum(-1)
+    valid = targets != -100
+    t = targets.clamp(min=0)
+    loss = torch.where(valid, lse - logits.gather(1, t[:, None])[:, 0], 0.0)
+    correct = ((logits.argmax(-1) == targets) & valid).to(torch.int32)
+    g = p[:k].clone()
+    g[torch.arange(k, device=h.device), t[:k]] -= 1.0
+    return entropy, loss, correct, (g * grad_scale) @ w.float()
+
+
 def verify(weight, host, device, hidden, grad_scale):
-    """Once, at the first step: the streamed head against the resident one on the first 8,192
+    """Once, at the first step: the streamed head against plain fp32 PyTorch on the first 8,192
     vocabulary rows (two chunks of 4,096, so the slot logic runs) and up to 64 of the step's
     tokens. Any difference, or any error, and the weight goes back to the GPU for good."""
     import sys
-
-    from .fused_ce import _rows_through_head
 
     VERIFIED["done"] = True
     try:
@@ -274,7 +287,7 @@ def verify(weight, host, device, hidden, grad_scale):
         targets[h.shape[0] // 2:] = -100
         k = h.shape[0] // 2
         resident = host[:sub].to(device)
-        ref = _rows_through_head(h, resident, targets, True, k)
+        ref = _plain_head(h, resident, targets, k, grad_scale)
         got = rows_through_streamed_head(h, HeadStream(host[:sub], device, chunk=sub // 2),
                                          targets, True, k, grad_scale)
         del resident
