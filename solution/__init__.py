@@ -7,12 +7,14 @@ before Soup builds the model and the trainer.
 - `nf4.py`       NF4 dequantization in one kernel, straight to fp16, for every 4-bit layer
 - `rmsnorm.py`   RMSNorm forward and backward in one kernel each, with the fp16 copy those
                  layers need
-- `unpad.py`     the decoder layers on real tokens only, attention on the padded layout
+- `unpad.py`     the decoder layers on real tokens only, attention row by row
 - `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
 - `warmup.py`    our kernels compile while the model loads, not in the first step
 - `rope.py`      rotary embedding + fp16 cast + k/v expansion for attention, one kernel each way
 - `mlp.py`       in long batches the MLP keeps only its fp16 input and recomputes gate/up
+- `imports.py`   TRL reuses transformers' package-metadata scan instead of a second one
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
+- `test_kernels.py`  every kernel against plain PyTorch (GPU): `python -m pytest solution -q`
 """
 
 import sys
@@ -28,6 +30,9 @@ def _try(name, patch):
 
 
 def apply():
+    from .imports import import_trl
+
+    _try("one package-metadata scan", import_trl)  # before anything of ours imports TRL
     from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
     from .nf4 import patch_bnb_matmul_4bit, patch_linear4bit
     from .rmsnorm import patch_qwen2_rmsnorm
@@ -50,5 +55,3 @@ def apply():
 
     _try("fp16 tied embedding", patch_embedding)
     _try("kernel warm-up", start)  # compiles our kernels while Soup loads the model
-    from .debug import install
-    install()  # does nothing unless SOUP_SOLUTION_DEBUG=1

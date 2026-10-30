@@ -6,10 +6,12 @@ works on padding. The rules allow removing pad tokens inside a batch (not mixing
 
 Here the decoder runs on the real tokens only, as one [1, N, hidden] sequence. Each token keeps the
 position id and rotary embedding it has in the padded batch. Attention is the one place where rows
-must not see each other: there q, k and v are scattered back to the padded [B, T] layout and the
-same attention function runs with the same mask as in the base run, so every real token attends
-to exactly the keys it attends to in the base; the output is gathered back to the real tokens.
-After the final norm the hidden states are scattered back to [B, T, hidden] for the head.
+must not see each other. When every row's real tokens are one contiguous run (TRL pads on the
+right), attention runs row by row, causal, without a mask: a real token attends to exactly the keys
+the base run's padding mask lets it see (its own row's real tokens up to itself), and no work goes
+to padding. Otherwise q, k and v are scattered back to the padded [B, T] layout and the same
+attention function runs with the same mask as in the base run. After the final norm the hidden
+states are scattered back to [B, T, hidden] for the head.
 
 LoRA dropout keeps the base run's random masks: the mask is drawn by the same dropout call on a
 tensor of the padded shape (the same RNG draw, element for element) and the real tokens' rows of it
@@ -24,7 +26,6 @@ import triton
 import triton.language as tl
 
 _LOCAL = threading.local()
-LAST_TOKENS = None  # (real, padded) tokens of the last batch, for the debug log
 _ALLOW_CPU = False  # tests only: run on CPU tensors (TRITON_INTERPRET=1)
 
 
@@ -246,8 +247,6 @@ def patch_qwen2_model():
         batch, seq = input_ids.shape
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
         n_real = rows.numel()  # one sync, as TRL's own .item() calls on the mask
-        global LAST_TOKENS
-        LAST_TOKENS = (n_real, batch * seq)
         if n_real == batch * seq or n_real == 0:
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
@@ -275,7 +274,6 @@ def patch_qwen2_model():
         cfg = self.config
         ctx.recompute_layers = layers_to_recompute(n_real, cfg.num_hidden_layers,
                                                    cfg.intermediate_size, cfg.hidden_size)
-        LAST_TOKENS = (n_real, batch * seq, ctx.recompute_layers)
         _LOCAL.ctx = ctx
         try:
             for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):

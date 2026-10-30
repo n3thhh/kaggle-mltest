@@ -11,7 +11,7 @@ The organizers' example kernels, which run in the same steps, are compiled the s
 import threading
 
 _THREAD = None
-TIMES = {}  # when the warm-up started / finished and how long the first step waited (debug log)
+TIMES = {}  # when the warm-up started / finished and how long the first step waited
 VOCAB = 151936   # Qwen2.5's vocabulary (the head's rows)
 HIDDEN = 1536    # Qwen2.5-1.5B's hidden size
 
