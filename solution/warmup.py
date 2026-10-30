@@ -178,8 +178,9 @@ def _count_cache_hits():
 # Triton's compiler runs partly in Python: compiling in a thread of the training process holds the
 # GIL for seconds while that process imports libraries and loads the model. So two helper processes
 # (the T4 machines have 4 CPUs) compile the kernels into Triton's cache directory of this run
-# (TRITON_CACHE_DIR, inherited), for the T4's target (sm_75) without touching the GPU; the thread
-# here then only reads the compiled kernels from the cache and loads them. Should the helpers fail
+# (TRITON_CACHE_DIR, inherited), for the T4's target (sm_75) without touching the GPU, together
+# with their C launchers (built by the C compiler, about 0.5 s each); the thread here then only
+# reads them from the cache and loads them. Should the helpers fail
 # or produce other cache keys, the thread compiles as before.
 
 HELPERS = []
@@ -208,10 +209,24 @@ _run = JITFunction.run
 
 
 def _compile_only(self, *args, grid, warmup, **kwargs):
-    return _run(self, *args, grid=grid, warmup=True, **kwargs)
+    kernel = _run(self, *args, grid=grid, warmup=True, **kwargs)
+    try:  # the kernel's C launcher (built with the C compiler, cached by its source)
+        from triton.backends.nvidia.driver import CudaLauncher
+
+        CudaLauncher(kernel.src, kernel.metadata)
+    except Exception:
+        pass
+    return kernel
 
 
 JITFunction.run = _compile_only
+if sys.argv[2] == "0":
+    try:  # Triton's CUDA helper module, also built with the C compiler at first use
+        from triton.backends.nvidia.driver import CudaUtils
+
+        CudaUtils()
+    except Exception:
+        pass
 from solution import warmup
 
 warmup._compile_all(offline=True, part=int(sys.argv[2]), parts=int(sys.argv[3]))
