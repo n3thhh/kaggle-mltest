@@ -38,3 +38,5 @@ def apply():
     _try("padding-free decoder", patch_qwen2_model)
     _try("padding-free attention", patch_qwen2_attention)
     _try("LoRA dropout with the base masks", patch_dropout)
+    from .debug import install
+    install()  # does nothing unless SOUP_SOLUTION_DEBUG=1
