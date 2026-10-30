@@ -10,6 +10,7 @@ before Soup builds the model and the trainer.
 - `unpad.py`     the decoder layers on real tokens only, attention on the padded layout
 - `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
 - `warmup.py`    our kernels compile while the model loads, not in the first step
+- `rope.py`      rotary embedding + fp16 cast + k/v expansion for attention, one kernel each way
 - `mlp.py`       the MLP keeps only its fp16 input and recomputes gate/up in the backward pass
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 """

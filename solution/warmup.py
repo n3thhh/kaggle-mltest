@@ -19,7 +19,7 @@ HIDDEN = 1536    # Qwen2.5-1.5B's hidden size
 def _compile_all():
     import torch
 
-    from . import fused_ce, nf4, rmsnorm, swiglu, unpad
+    from . import fused_ce, nf4, rmsnorm, rope, swiglu, unpad
 
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
@@ -45,6 +45,14 @@ def _compile_all():
         lambda: unpad.rows_masked_scale_kernel.warmup(
             t(HIDDEN, f32), t(HIDDEN, torch.bool), t(1, torch.int64), t(HIDDEN, f32), HIDDEN,
             1.0 / 0.95, BLOCK=unpad.ROW_BLOCK, grid=(1, 2)),
+        lambda: rope.rope_expand_fwd_kernel.warmup(
+            t(12 * 128, f16), t(2 * 128, f16), t(2 * 128, f16), t(128, f32), t(128, f32),
+            t(12 * 128, f16), t(12 * 128, f16), t(12 * 128, f16), 1, N_HEADS=12, N_KV=2,
+            HEAD_DIM=128, grid=(1, 12)),
+        lambda: rope.rope_expand_bwd_kernel.warmup(
+            t(12 * 128, f16), t(12 * 128, f16), t(12 * 128, f16), t(128, f32), t(128, f32),
+            t(12 * 128, f16), t(2 * 128, f16), t(2 * 128, f16), 1, N_HEADS=12, N_KV=2,
+            HEAD_DIM=128, grid=(1, 14)),
         lambda: swiglu.example_swiglu_fwd_kernel.warmup(
             t(8960, f16), t(8960, f16), t(8960, f16), 8960, BLOCK=swiglu.BLOCK, grid=(1,)),
         lambda: swiglu.example_swiglu_bwd_kernel.warmup(

@@ -153,35 +153,37 @@ def patch_qwen2_attention():
             return original(self, hidden_states, position_embeddings, attention_mask,
                             past_key_values=past_key_values, **kwargs)
         n, d = ctx.n, self.head_dim
+        dropout = 0.0 if not self.training else self.attention_dropout
+        cos, sin = position_embeddings
+        if ctx.segments is not None and not dropout and cos.shape[-1] == d and d % 2 == 0:
+            # Rotary embedding, fp16 cast and k/v expansion in one kernel of ours (rope.py), then
+            # each row on its own, causal, with no mask: a real token sees the same keys as under
+            # the base run's padding mask (its row's real tokens up to itself) and no work goes
+            # to padding. k and v come expanded to all query heads, as repeat_kv does for the
+            # base run's masked call, which keeps PyTorch on its memory-efficient kernel (SDPA's
+            # enable_gqa would fall back to the slow fp32 math kernel on a T4).
+            from .rope import RopeExpand
+
+            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else \
+                torch.float32
+            q, k, v = RopeExpand.apply(
+                self.q_proj(hidden_states).view(n, -1, d), self.k_proj(hidden_states).view(n, -1, d),
+                self.v_proj(hidden_states).view(n, -1, d), cos.reshape(n, d), sin.reshape(n, d),
+                dtype)
+            outs = []
+            for start, stop in ctx.segments:
+                outs.append(torch.nn.functional.scaled_dot_product_attention(
+                    q[None, :, start:stop], k[None, :, start:stop], v[None, :, start:stop],
+                    is_causal=stop - start > 1, scale=self.scaling))
+            out = torch.cat(outs, dim=2).transpose(1, 2).reshape(1, n, -1)
+            return self.o_proj(out), None
+
         query = self.q_proj(hidden_states).view(1, n, -1, d).transpose(1, 2)
         key = self.k_proj(hidden_states).view(1, n, -1, d).transpose(1, 2)
         value = self.v_proj(hidden_states).view(1, n, -1, d).transpose(1, 2)
-        cos, sin = position_embeddings
         query, key = mq.apply_rotary_pos_emb(query, key, cos, sin)
-
         interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation,
                                                              mq.eager_attention_forward)
-        dropout = 0.0 if not self.training else self.attention_dropout
-        if ctx.segments is not None and not self.attention_dropout:
-            # Each row on its own, causal, with no mask: a real token sees the same keys as under
-            # the base run's padding mask (its row's real tokens up to itself), and no work is
-            # spent on padding. k and v are expanded to all query heads (repeat_kv, as the base
-            # run's masked SDPA call does) so PyTorch keeps its memory-efficient kernel; SDPA
-            # with enable_gqa would fall back to the slow fp32 math kernel on a T4.
-            groups = self.num_key_value_groups
-            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else \
-                query.dtype
-            q = query.to(dtype)
-            k = mq.repeat_kv(key.to(dtype), groups)
-            v = mq.repeat_kv(value.to(dtype), groups)
-            outs = []
-            for start, stop in ctx.segments:
-                out = torch.nn.functional.scaled_dot_product_attention(
-                    q[:, :, start:stop], k[:, :, start:stop], v[:, :, start:stop],
-                    is_causal=stop - start > 1, scale=self.scaling)
-                outs.append(out)
-            out = torch.cat(outs, dim=2).transpose(1, 2).reshape(1, n, -1)
-            return self.o_proj(out), None
 
         def padded(states):  # [1, heads, N, d] -> [B, heads, T, d]
             return _scatter(states[0].transpose(0, 1), ctx.rows, ctx.batch, ctx.seq).transpose(1, 2)
