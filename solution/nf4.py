@@ -55,8 +55,17 @@ def _absmax_fp32(quant_state):
     return absmax, code
 
 
+def _resident(packed, quant_state):
+    """The packed bytes on the GPU: the weight itself, or its copy from pinned host memory when
+    offload.py keeps it there (the parameter then holds a zero-stride placeholder)."""
+    if getattr(quant_state, "_soup_host", None) is not None:
+        return quant_state._soup_host.to(packed.device, non_blocking=True)
+    return packed
+
+
 def dequantize_nf4(packed, quant_state, dtype=torch.float16):
     """The [N, K] weight of a 4-bit NF4 layer in `dtype`."""
+    packed = _resident(packed, quant_state)
     absmax, code = _absmax_fp32(quant_state)
     out = torch.empty(tuple(quant_state.shape), dtype=dtype, device=packed.device)
     n = out.numel()
@@ -157,7 +166,7 @@ def patch_linear4bit():
             return original(self, x)
         fix_state(self)
         quant_state = self.weight.quant_state
-        if not x.is_cuda or not _supported(x, self.weight, quant_state):
+        if not x.is_cuda or not _supported(x, _resident(self.weight, quant_state), quant_state):
             return original(self, x)
         if not self.compute_type_is_set:
             self.set_compute_type(x)
@@ -193,6 +202,7 @@ def patch_bnb_matmul_4bit():
     original = bitsandbytes.matmul_4bit
 
     def matmul_4bit(A, B, quant_state, out=None, bias=None):
+        B = _resident(B, quant_state).view(B.shape) if quant_state is not None else B
         if out is not None or not _supported(A, B, quant_state) or \
                 _base_uses_fused_kernel(A, quant_state):
             return original(A, B, quant_state, out=out, bias=bias)

@@ -105,14 +105,16 @@ def _head_weight(weight, dtype):
     return _WEIGHT_CACHE["head"][1]
 
 
-def _rows_through_head(hidden, weight16, targets, with_grad):
-    """Stats (and the scaled hidden-state gradient) for the selected rows, chunk by chunk."""
+def _rows_through_head(hidden, weight16, targets, with_grad, n_grad):
+    """Stats for the selected rows, chunk by chunk, and the scaled hidden-state gradient of the
+    first `n_grad` rows (the labelled ones, sorted first; the others have zero gradient)."""
     n_rows, n_vocab = hidden.shape[0], weight16.shape[0]
     device = hidden.device
     entropy = torch.empty(n_rows, dtype=torch.float32, device=device)
     token_loss = torch.empty(n_rows, dtype=torch.float32, device=device)
     correct = torch.empty(n_rows, dtype=torch.int32, device=device)
-    grad = torch.empty_like(hidden) if with_grad else None
+    grad = torch.empty((n_grad, hidden.shape[1]), dtype=hidden.dtype, device=device) \
+        if with_grad else None
     if n_rows == 0:
         return entropy, token_loss, correct, grad
     chunk = min(ROWS_PER_CHUNK, n_rows)
@@ -123,31 +125,42 @@ def _rows_through_head(hidden, weight16, targets, with_grad):
         stop = min(start + chunk, n_rows)
         part = logits[: stop - start]
         torch.mm(hidden[start:stop], weight16.t(), out=part)
+        write_grad = with_grad and start < n_grad
         ce_row_stats_kernel[(stop - start,)](
             part, part.stride(0), start, targets, entropy, token_loss, correct, GRAD_SCALE,
-            N_VOCAB=n_vocab, BLOCK_V=VOCAB_BLOCK, WRITE_GRAD=with_grad, num_warps=8)
-        if with_grad:
-            torch.mm(part, weight16, out=grad[start:stop])
+            N_VOCAB=n_vocab, BLOCK_V=VOCAB_BLOCK, WRITE_GRAD=write_grad, num_warps=8)
+        if write_grad:
+            end = min(stop, n_grad)
+            torch.mm(part[: end - start], weight16, out=grad[start:end])
     return entropy, token_loss, correct, grad
 
 
 class FusedLinearCrossEntropy(torch.autograd.Function):
     """sum over labelled positions of cross_entropy(hidden @ weight.T) / denominator, with the
-    gradient on `hidden` computed in the forward pass. The weight must be frozen."""
+    gradient on `hidden` computed in the forward pass. The weight must be frozen. `rows` lists
+    the labelled positions first (`n_grad` of them): only they get a gradient."""
 
     @staticmethod
-    def forward(ctx, hidden, weight, targets, rows, denominator, compute_dtype):
+    def forward(ctx, hidden, weight, targets, rows, n_grad, denominator, compute_dtype,
+                stream=None):
         shape = hidden.shape
         flat = hidden.detach().reshape(-1, shape[-1])
         picked = flat.index_select(0, rows).to(compute_dtype).contiguous()
-        weight16 = _head_weight(weight.detach(), compute_dtype)
         with_grad = ctx.needs_input_grad[0]
-        entropy, token_loss, correct, grad = _rows_through_head(
-            picked, weight16, targets.index_select(0, rows).contiguous(), with_grad)
+        picked_targets = targets.index_select(0, rows).contiguous()
+        if stream is not None:  # the head weight lives in host memory (head_stream.py)
+            from .head_stream import rows_through_streamed_head
+
+            entropy, token_loss, correct, grad = rows_through_streamed_head(
+                picked, stream, picked_targets, with_grad, n_grad, GRAD_SCALE)
+        else:
+            weight16 = _head_weight(weight.detach(), compute_dtype)
+            entropy, token_loss, correct, grad = _rows_through_head(
+                picked, weight16, picked_targets, with_grad, n_grad)
         loss = token_loss.sum() / denominator
         ctx.shape, ctx.dtype = shape, hidden.dtype
         if with_grad:
-            ctx.save_for_backward(grad, rows, denominator)
+            ctx.save_for_backward(grad, rows[:n_grad], denominator)
         return loss, entropy, token_loss, correct
 
     @staticmethod
@@ -157,7 +170,7 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         grad_hidden = torch.zeros((ctx.shape.numel() // ctx.shape[-1], ctx.shape[-1]),
                                   dtype=ctx.dtype, device=grad.device)
         grad_hidden.index_copy_(0, rows, (grad.float() * factor).to(ctx.dtype))
-        return grad_hidden.view(ctx.shape), None, None, None, None, None
+        return grad_hidden.view(ctx.shape), None, None, None, None, None, None, None
 
 
 def fused_linear_cross_entropy(hidden, weight, labels, attention_mask=None,
@@ -173,6 +186,11 @@ def fused_linear_cross_entropy(hidden, weight, labels, attention_mask=None,
     else:
         rows = torch.arange(batch * seq, device=device)
     labelled = (targets != IGNORE_INDEX).sum()
+    # Labelled positions first: only they need the gradient pass and its GEMM.
+    has_label = targets.index_select(0, rows) != IGNORE_INDEX
+    with_label, without = rows[has_label], rows[~has_label]
+    n_grad = with_label.numel()
+    rows = torch.cat([with_label, without])
     if num_items_in_batch is None:
         denominator = labelled.float()
     elif torch.is_tensor(num_items_in_batch):
@@ -183,8 +201,16 @@ def fused_linear_cross_entropy(hidden, weight, labels, attention_mask=None,
         compute_dtype = torch.get_autocast_dtype(device.type)
     else:
         compute_dtype = torch.result_type(hidden, weight)
+    from . import head_stream as hs
+
+    host = hs.host_of(weight)
+    if host is not None and not hs.VERIFIED["done"] and device.type == "cuda":
+        picked = hidden.detach().reshape(-1, hidden.shape[-1]).index_select(0, rows)
+        hs.verify(weight, host, device, picked.to(torch.float16), GRAD_SCALE)
+        host = hs.host_of(weight)
+    stream = hs.head_stream(host, device) if host is not None else None
     loss, entropy, token_loss, correct = FusedLinearCrossEntropy.apply(
-        hidden, weight, targets, rows, denominator, compute_dtype)
+        hidden, weight, targets, rows, n_grad, denominator, compute_dtype, stream)
 
     def spread(values):
         full = torch.zeros(batch * seq, dtype=values.dtype, device=device)
@@ -225,17 +251,23 @@ def patch_qwen2_causal_lm():
                 "shift_labels" in kwargs or type(head) is not torch.nn.Linear or \
                 head.bias is not None or head.weight.requires_grad or \
                 getattr(self.config, "final_logit_softcapping", None) is not None:
-            return original(self, input_ids=input_ids, attention_mask=attention_mask,
-                            position_ids=position_ids, past_key_values=past_key_values,
-                            inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
-                            logits_to_keep=logits_to_keep, **kwargs)
+            from .head_stream import materialized
+
+            with materialized(head.weight):
+                return original(self, input_ids=input_ids, attention_mask=attention_mask,
+                                position_ids=position_ids, past_key_values=past_key_values,
+                                inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
+                                logits_to_keep=logits_to_keep, **kwargs)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
                              position_ids=position_ids, past_key_values=past_key_values,
                              inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
         hidden = outputs.last_hidden_state
         if not (hidden.is_cuda or _ALLOW_CPU):
+            from .head_stream import materialized
+
             capture.step = None
-            logits = head(hidden)
+            with materialized(head.weight):
+                logits = head(hidden)
             loss = self.loss_function(logits=logits, labels=labels,
                                       vocab_size=self.config.vocab_size, **kwargs)
             return CausalLMOutputWithPast(loss=loss, logits=logits,

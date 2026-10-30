@@ -7,12 +7,16 @@ before Soup builds the model and the trainer.
 - `nf4.py`       NF4 dequantization in one kernel, straight to fp16, for every 4-bit layer
 - `rmsnorm.py`   RMSNorm forward and backward in one kernel each, with the fp16 copy those
                  layers need
-- `unpad.py`     the decoder layers on real tokens only, attention row by row
+- `layer.py`     a whole decoder layer as one autograd function: fused q|k|v and gate|up GEMMs,
+                 LoRA inside, variable-length attention, hand-written backward pass
+- `unpad.py`     the decoder on real tokens only (padding removed inside the batch)
 - `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
 - `warmup.py`    our kernels compile while the model loads, not in the first step
 - `rope.py`      rotary embedding + fp16 cast + k/v expansion for attention, one kernel each way
 - `mlp.py`       in long batches the MLP keeps only its fp16 input and recomputes gate/up
 - `imports.py`   TRL reuses transformers' package-metadata scan instead of a second one
+- `offload.py`   4-bit weights and saved activations in pinned host memory, streamed per layer
+- `head_stream.py` the tied embedding / head in pinned host memory: loss over vocabulary chunks
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 - `test_kernels.py`  every kernel against plain PyTorch (GPU): `python -m pytest solution -q`
 """
@@ -50,8 +54,15 @@ def apply():
     _try("padding-free decoder", patch_qwen2_model)
     _try("padding-free attention", patch_qwen2_attention)
     _try("LoRA dropout with the base masks", patch_dropout)
-    from .embed import patch_embedding
+    from .embed import patch_embedding, patch_prepare_kbit
     from .warmup import start
 
     _try("fp16 tied embedding", patch_embedding)
+    _try("tied embedding kept fp16 at load", patch_prepare_kbit)
     _try("kernel warm-up", start)  # compiles our kernels while Soup loads the model
+    from . import offload
+
+    if offload.ENABLED:  # before the model is loaded: weights go to host memory as quantized
+        _try("4-bit weights in pinned host memory", offload.patch_quantize)
+        _try("loading without GPU pre-allocation, embedding to host memory",
+             offload.patch_loading)

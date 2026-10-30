@@ -252,15 +252,26 @@ def patch_qwen2_model():
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
 
+        from . import layer as fused
+
+        cfg = self.config
+        layers = self.layers[: cfg.num_hidden_layers]
+        segments = _segments(attention_mask, cfg)
+        ctx = _Unpadded(rows, batch, seq, n_real, segments)
+        all_fused = segments is not None and fused.STATE["use_fused"] and all(
+            fused.eligible_cached(layer, input_ids.is_cuda) for layer in layers)
+
         # Everything the base forward builds on the padded batch, built the same way.
         inputs_embeds = self.embed_tokens(input_ids)
         position_ids = torch.arange(seq, device=inputs_embeds.device).unsqueeze(0)
-        mask_kwargs = {"config": self.config, "inputs_embeds": inputs_embeds,
-                       "attention_mask": attention_mask, "past_key_values": None,
-                       "position_ids": position_ids}
-        masks = {"full_attention": mq.create_causal_mask(**mask_kwargs)}
-        if self.has_sliding_layers:
-            masks["sliding_attention"] = mq.create_sliding_window_causal_mask(**mask_kwargs)
+        masks = None
+        if not all_fused:  # only the per-module path reads the padded attention mask
+            mask_kwargs = {"config": cfg, "inputs_embeds": inputs_embeds,
+                           "attention_mask": attention_mask, "past_key_values": None,
+                           "position_ids": position_ids}
+            masks = {"full_attention": mq.create_causal_mask(**mask_kwargs)}
+            if self.has_sliding_layers:
+                masks["sliding_attention"] = mq.create_sliding_window_causal_mask(**mask_kwargs)
         cos, sin = self.rotary_emb(inputs_embeds, position_ids)  # [1, T, d]
 
         # ... then the real tokens only.
@@ -268,19 +279,56 @@ def patch_qwen2_model():
         hidden = inputs_embeds.reshape(batch * seq, -1).index_select(0, rows).unsqueeze(0)
         position_embeddings = (cos[0].index_select(0, token_pos).unsqueeze(0),
                                sin[0].index_select(0, token_pos).unsqueeze(0))
-        ctx = _Unpadded(rows, batch, seq, n_real, _segments(attention_mask, self.config))
-        from .mlp import layers_to_recompute
-
-        cfg = self.config
-        ctx.recompute_layers = layers_to_recompute(n_real, cfg.num_hidden_layers,
-                                                   cfg.intermediate_size, cfg.hidden_size)
         _LOCAL.ctx = ctx
         try:
-            for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-                hidden = layer(hidden, attention_mask=masks[self.config.layer_types[i]],
-                               position_embeddings=position_embeddings,
-                               position_ids=position_ids, past_key_values=None,
-                               use_cache=use_cache, **kwargs)
+            if all_fused:
+                bounds = [0] + [stop for _, stop in segments]
+                ctx.cu_seqlens = torch.tensor(bounds, dtype=torch.int32).to(rows.device)
+                ctx.max_seqlen = max(stop - start for start, stop in segments)
+                from . import offload
+
+                weights = offload.weight_stream(layers, rows.device) \
+                    if rows.device.type == "cuda" else None
+                store = offload.activation_store(rows.device)
+                ctx.handles = {}
+                if store is not None:
+                    store.begin_step(len(layers) * (fused.KEPT_BYTES_PER_TOKEN_LAYER * n_real +
+                                                    8 * 512) + 2**20)
+                recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
+                                                          cfg.intermediate_size,
+                                                          offloaded=store is not None)
+                cos2 = position_embeddings[0][0].float().contiguous()
+                sin2 = position_embeddings[1][0].float().contiguous()
+                hidden = hidden[0]
+                if not fused.STATE["verified"]:
+                    ok = fused.verify_first_layer(layers[0], hidden, ctx, cos2, sin2, weights,
+                                                  store)
+                    ctx.handles, ctx.mlp_calls = {}, 0
+                    if store is not None:
+                        store.begin_step(len(layers) * (fused.KEPT_BYTES_PER_TOKEN_LAYER *
+                                                        n_real + 8 * 512) + 2**20)
+                    if not ok:  # this and every later step: the per-module path
+                        _LOCAL.ctx = None
+                        return forward(self, input_ids=input_ids, attention_mask=attention_mask,
+                                       position_ids=position_ids,
+                                       past_key_values=past_key_values,
+                                       inputs_embeds=None, use_cache=use_cache, **kwargs)
+                for i, layer in enumerate(layers):
+                    hidden = fused.run_layer(layer, hidden, ctx, cos2, sin2, i < recompute,
+                                             index=i, weights=weights, store=store,
+                                             last=i == len(layers) - 1)
+                hidden = hidden.unsqueeze(0)
+            else:
+                from .mlp import layers_to_recompute
+
+                ctx.recompute_layers = layers_to_recompute(n_real, cfg.num_hidden_layers,
+                                                           cfg.intermediate_size,
+                                                           cfg.hidden_size)
+                for i, layer in enumerate(layers):
+                    hidden = layer(hidden, attention_mask=masks[cfg.layer_types[i]],
+                                   position_embeddings=position_embeddings,
+                                   position_ids=position_ids, past_key_values=None,
+                                   use_cache=use_cache, **kwargs)
         finally:
             _LOCAL.ctx = None
         hidden = self.norm(hidden)

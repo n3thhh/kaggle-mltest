@@ -219,3 +219,117 @@ def test_recomputed_mlp_matches_unfused():
     out.backward(g)
     torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(x.grad, expected, rtol=5e-3, atol=5e-3)
+
+
+# --- layer.py + offload.py: a whole tiny model against the stock modules -------------------
+
+def _tiny_qlora(seed=0):
+    import bitsandbytes as bnb
+    from peft import LoraConfig, get_peft_model
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(seed)
+    cfg = Qwen2Config(vocab_size=512, hidden_size=256, intermediate_size=512,
+                      num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+                      tie_word_embeddings=True, attn_implementation="sdpa")
+    model = Qwen2ForCausalLM(cfg).half()
+
+    def quantize(linear):
+        q = bnb.nn.Linear4bit(linear.in_features, linear.out_features,
+                              bias=linear.bias is not None, compute_dtype=torch.float16,
+                              quant_type="nf4", compress_statistics=True)
+        q.weight = bnb.nn.Params4bit(linear.weight.data.clone(), requires_grad=False,
+                                     quant_type="nf4", compress_statistics=True, blocksize=64)
+        if linear.bias is not None:
+            q.bias = torch.nn.Parameter(linear.bias.data.clone(), requires_grad=False)
+        return q.cuda()
+
+    for layer in model.model.layers:
+        for parent, names in ((layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
+                              (layer.mlp, ("gate_proj", "up_proj", "down_proj"))):
+            for name in names:
+                setattr(parent, name, quantize(getattr(parent, name)))
+    model.cuda()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in model.parameters():  # as prepare_model_for_kbit_training does
+        if p.dtype == torch.float16 and type(p).__name__ != "Params4bit":
+            p.data = p.data.float()
+    model = get_peft_model(model, LoraConfig(r=8, lora_alpha=16, lora_dropout=0.1,
+                                             target_modules=["q_proj", "v_proj"]))
+    for name, p in model.named_parameters():
+        if "lora_B" in name:
+            torch.nn.init.normal_(p, std=0.02)
+    model.train()
+    batch, seq = 3, 40
+    ids = torch.randint(0, 512, (batch, seq), device="cuda")
+    mask = torch.ones(batch, seq, dtype=torch.long, device="cuda")
+    mask[0, 25:] = 0
+    mask[2, 9:] = 0
+    labels = ids.clone()
+    labels[:, :5] = -100
+    labels[mask == 0] = -100
+    return model, ids, mask, labels
+
+
+def _loss_and_grads(model, ids, mask, labels, fused):
+    from types import SimpleNamespace
+
+    import solution.fused_ce as fc
+
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    model.zero_grad(set_to_none=True)
+    fc._LOCAL.capture = SimpleNamespace(step=None) if fused else None
+    try:
+        with torch.autocast("cuda", dtype=torch.float16):
+            loss = model(input_ids=ids, attention_mask=mask, labels=labels).loss
+    finally:
+        fc._LOCAL.capture = None
+    loss.backward()
+    grads = {n: p.grad.float().clone() for n, p in model.named_parameters() if p.grad is not None}
+    return loss.item(), grads, torch.cuda.get_rng_state()
+
+
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_fused_layer_matches_stock_modules(offloaded):
+    import solution
+    import solution.layer as layer
+    import solution.offload as offload
+
+    if offloaded:
+        offload.patch_quantize()  # weights quantized from here on live in host memory
+    model, ids, mask, labels = _tiny_qlora()
+    if offloaded:
+        qs = model.base_model.model.model.layers[0].mlp.down_proj.weight.quant_state
+        assert offload.is_offloaded(qs)
+    loss0, grads0, rng0 = _loss_and_grads(model, ids, mask, labels, fused=False)
+    solution.apply()
+    loss1, grads1, rng1 = _loss_and_grads(model, ids, mask, labels, fused=True)
+    assert all(v[1] for v in layer._ELIGIBLE.values()), "the fused layer was not used"
+    assert torch.equal(rng0, rng1), "dropout drew different random numbers"
+    assert abs(loss0 - loss1) <= 2e-3 * abs(loss0)
+    for name, g in grads0.items():
+        scale = g.abs().max().item() + 1e-12
+        assert (grads1[name] - g).abs().max().item() <= 3e-2 * scale, name
+
+
+# --- head_stream.py ---------------------------------------------------------------------------
+
+def test_streamed_head_matches_resident():
+    import solution.fused_ce as fc
+    import solution.head_stream as hs
+
+    torch.manual_seed(0)
+    n, hidden, vocab = 300, 256, 20011  # three chunks, a ragged last one
+    h = (torch.randn(n, hidden, device="cuda") * 0.5).half()
+    w = (torch.randn(vocab, hidden, device="cuda") * 0.05).half()
+    t = torch.randint(0, vocab, (n,), device="cuda")
+    t[200:] = -100
+    ref = fc._rows_through_head(h, w, t, True, 200)
+    stream = hs.HeadStream(w.cpu().pin_memory(), torch.device("cuda"), chunk=8192)
+    got = hs.rows_through_streamed_head(h, stream, t, True, 200, fc.GRAD_SCALE)
+    torch.testing.assert_close(got[0], ref[0], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(got[1], ref[1], rtol=1e-3, atol=1e-3)
+    assert (got[2] != ref[2]).sum().item() <= 2
+    torch.testing.assert_close(got[3], ref[3].float(), rtol=2e-2, atol=2e-2 * 4096)
