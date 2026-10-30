@@ -90,7 +90,7 @@ class NF4Linear(torch.autograd.Function):
         return grad_x, None, None, grad_bias
 
 
-def _base_uses_fused_kernel(x, quant_state):
+def _base_uses_fused_kernel(x, quant_state, dtype=None):
     """True where bitsandbytes' CUDA backend would run its own fused 4-bit GEMM for this batch
     (small M); there we keep its path so the numerics stay those of the base run."""
     try:
@@ -103,7 +103,7 @@ def _base_uses_fused_kernel(x, quant_state):
     try:
         if m > cuda_ops._gemm_4bit_custom_max_m or k % quant_state.blocksize != 0:
             return False
-        return bool(cuda_ops._gemm_4bit_use_custom_fn(x.device.index, x.dtype, m, n, k))
+        return bool(cuda_ops._gemm_4bit_use_custom_fn(x.device.index, dtype or x.dtype, m, n, k))
     except Exception:  # noqa: BLE001 - a different bitsandbytes: be conservative
         return True
 
@@ -116,6 +116,64 @@ def _supported(x, packed, quant_state):
             and quant_state.blocksize % 2 == 0
             and (not quant_state.nested or quant_state.state2.blocksize == 256)
             and packed.dtype == torch.uint8 and packed.is_contiguous())
+
+
+def _gemm_dtype(module, x):
+    """The dtype the base run's GEMM actually runs in: autocast's when it is on (F.linear inside
+    bitsandbytes is autocast), the layer's compute dtype otherwise."""
+    if torch.is_autocast_enabled(x.device.type):
+        return torch.get_autocast_dtype(x.device.type)
+    return module.compute_dtype or x.dtype
+
+
+def patch_linear4bit():
+    """Linear4bit.forward through NF4Linear, dequantizing straight to the GEMM's dtype.
+
+    With an fp32 input (the residual stream is fp32 after prepare_model_for_kbit_training) the
+    base layer switches its compute dtype to fp32: bitsandbytes dequantizes the weight to fp32,
+    autocast then copies it (and the input) to fp16 for the GEMM, and the fp16 result is copied
+    back to fp32. Here the weight is dequantized to fp16 directly (the same fp32 product rounded
+    once, so the same fp16 weight), the input is cast once (or taken from the fp16 copy our
+    RMSNorm already wrote), and the output stays fp16: every consumer in Qwen2 either upcasts it
+    exactly (residual add, RoPE) or casts it to fp16 anyway (SDPA, the next 4-bit layer)."""
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import modules as bnb_modules
+
+    cls = bnb_modules.Linear4bit
+    if getattr(cls.forward, "_soup_patched", False):
+        return
+    original = cls.forward
+    fix_state = bnb_modules.fix_4bit_weight_quant_state_from_module
+
+    def forward(self, x):
+        if type(self) is not cls and type(self).forward is not forward:
+            return original(self, x)
+        fix_state(self)
+        quant_state = self.weight.quant_state
+        if not x.is_cuda or not _supported(x, self.weight, quant_state):
+            return original(self, x)
+        if not self.compute_type_is_set:
+            self.set_compute_type(x)
+            self.compute_type_is_set = True
+        gemm_dtype = _gemm_dtype(self, x)
+        base_dtype = self.compute_dtype or x.dtype
+        if gemm_dtype not in (torch.float16, torch.float32) or \
+                _base_uses_fused_kernel(x, quant_state, base_dtype):
+            return original(self, x)
+        half = getattr(x, "_soup_half", None)
+        if half is not None and half.dtype == gemm_dtype and half.shape == x.shape:
+            x = half
+        else:
+            x = x.to(gemm_dtype)
+        bias = self.bias
+        if bias is not None:
+            if bias.dtype != base_dtype:  # as Linear4bit.forward does to its bias
+                bias.data = bias.data.to(base_dtype)
+            bias = bias.to(gemm_dtype)
+        return NF4Linear.apply(x, self.weight.view(-1), quant_state, bias)
+
+    forward._soup_patched = True
+    cls.forward = forward
 
 
 def patch_bnb_matmul_4bit():

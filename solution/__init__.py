@@ -4,8 +4,9 @@ The harness imports this package and calls `apply()` once, in the same process a
 before Soup builds the model and the trainer.
 
 - `fused_ce.py`  the output head and the loss in chunks, no [batch, seq, vocab] logits (memory)
-- `nf4.py`       NF4 dequantization in one kernel for every 4-bit linear layer, both directions
-- `rmsnorm.py`   RMSNorm forward and backward in one kernel each
+- `nf4.py`       NF4 dequantization in one kernel, straight to fp16, for every 4-bit layer
+- `rmsnorm.py`   RMSNorm forward and backward in one kernel each, with the fp16 copy those
+                 layers need
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 """
 
@@ -23,11 +24,12 @@ def _try(name, patch):
 
 def apply():
     from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
-    from .nf4 import patch_bnb_matmul_4bit
+    from .nf4 import patch_bnb_matmul_4bit, patch_linear4bit
     from .rmsnorm import patch_qwen2_rmsnorm
 
     _try("example SwiGLU", patch_qwen2_mlp)
     _try("NF4 dequantization", patch_bnb_matmul_4bit)
+    _try("4-bit linear layers in fp16", patch_linear4bit)
     _try("RMSNorm", patch_qwen2_rmsnorm)
     _try("fused head and loss (model)", patch_qwen2_causal_lm)
     _try("fused head and loss (trainer)", patch_sft_trainer)
