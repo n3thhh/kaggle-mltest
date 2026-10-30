@@ -160,11 +160,22 @@ class HeadStream:
         vocab, hidden = host.shape
         self.chunks = [(c0, min(c0 + chunk, vocab)) for c0 in range(0, vocab, chunk)]
         self.cuda = device.type == "cuda"
+        self.chunk, self.hidden = chunk, hidden
+        self.slots = None
         if self.cuda:
             self.stream = torch.cuda.Stream(device)
-            self.slots = [{"idx": None, "buf": torch.empty((chunk, hidden), dtype=host.dtype,
-                                                            device=device),
+
+    def open(self):
+        """GPU slots for one pass over the vocabulary (released by close(), so the rest of the
+        step can use that memory)."""
+        if self.cuda and self.slots is None:
+            self.slots = [{"idx": None, "buf": torch.empty((self.chunk, self.hidden),
+                                                            dtype=self.host.dtype,
+                                                            device=self.device),
                            "ready": torch.cuda.Event()} for _ in range(2)]
+
+    def close(self):
+        self.slots = None
 
     def _load(self, slot, j):
         c0, c1 = self.chunks[j]
@@ -180,6 +191,7 @@ class HeadStream:
         c0, c1 = self.chunks[j]
         if not self.cuda:
             return self.host[c0:c1]
+        self.open()
         here = next((s for s in self.slots if s["idx"] == j), None)
         if here is None:
             spare = [s for s in self.slots if s["idx"] != prefetch]
@@ -234,7 +246,7 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
     block_h = triton.next_power_of_2(hidden_size)
     for j in range(count):
         c0, c1 = stream.chunks[j]
-        w = stream.get(j, j + 1 if j + 1 < count else 0)  # then the next step's first
+        w = stream.get(j, j + 1 if j + 1 < count else None)
         part = logits[:, : c1 - c0]
         torch.mm(hidden, w.t(), out=part)
         ce_chunk_stats_kernel[(n,)](part, part.stride(0), c1 - c0, c0, targets, m, s, d, best,
@@ -249,6 +261,7 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
     from .layer import sample_memory
 
     sample_memory("head", device)
+    stream.close()
     ce_finalize_kernel[(triton.cdiv(n, 1024),)](targets, m, s, d, bidx, tlogit, entropy,
                                                 token_loss, correct, lse, n, BLOCK=1024)
     if k > 0:

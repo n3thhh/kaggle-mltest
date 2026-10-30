@@ -110,6 +110,15 @@ def _timeline():
     def traced_train(self, *args, **kwargs):
         mark("trainer: train() starts")
         try:
+            import torch
+
+            from .layer import MEMORY
+
+            MEMORY["before training (max)"] = (torch.cuda.max_memory_allocated() / 2**20,
+                                               torch.cuda.max_memory_reserved() / 2**20)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             return train(self, *args, **kwargs)
         finally:
             mark("trainer: train() done")

@@ -651,13 +651,24 @@ class FusedDecoderLayer(torch.autograd.Function):
             gu = torch.mm(y2, w_gu_full.t())
             del y2
         d_act = torch.mm(dh2.to(dtype), _dequant((mlp.down_proj,), dtype, w_d))
-        d_gu = torch.empty_like(gu)
-        gate_up_act_bwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](d_act, gu, d_gu, inter,
+        # the gradient of gate|up overwrites gate|up (each element is read, then written)
+        gate_up_act_bwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](d_act, gu, gu, inter,
                                                                    BLOCK=ACT_BLOCK)
+        d_gu = gu
         del d_act, gu
-        if w_gu_full is None:
-            w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
-        dy2 = torch.mm(d_gu, w_gu_full)
+        # dy2 = d_gate @ W_gate + d_up @ W_up: one weight dequantized at a time
+        if w_gu_full is not None:
+            w_gate, w_up = w_gu_full[:inter], w_gu_full[inter:]
+            dy2 = torch.mm(d_gu[:, :inter], w_gate)
+            dy2.addmm_(d_gu[:, inter:], w_up)
+            del w_gate, w_up
+        else:
+            w_half = _dequant((mlp.gate_proj,), dtype, w_gu[0:1] if w_gu else None)
+            dy2 = torch.mm(d_gu[:, :inter], w_half)
+            del w_half
+            w_half = _dequant((mlp.up_proj,), dtype, w_gu[1:2] if w_gu else None)
+            dy2.addmm_(d_gu[:, inter:], w_half)
+            del w_half
         sample_memory("layer backward", x.device)
         del d_gu, w_gu_full
         dh1 = _norm_bwd(dy2, None, None, None, None, u.rows, x, o16, norm2.weight, rstd2, dh2,

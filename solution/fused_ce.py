@@ -369,8 +369,10 @@ def patch_sft_trainer():
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() / 2**20 if torch.cuda.is_available() else 0
             print(f"[solution] first step: forward pass and loss {time.perf_counter() - t0:.2f} s "
-                  "(with the warm-up wait and the self-checks)", file=sys.stderr)
+                  f"(with the warm-up wait and the self-checks), max allocated so far "
+                  f"{peak:.0f} MiB", file=sys.stderr)
         step = capture.step
         if step is None:  # the model took its own path and returned logits
             step = _step_from_logits(outputs.logits, inputs["labels"])
