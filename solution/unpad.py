@@ -290,29 +290,30 @@ def patch_qwen2_model():
                 weights = offload.weight_stream(layers, rows.device) \
                     if rows.device.type == "cuda" else None
                 store = offload.activation_store(rows.device)
-                ctx.handles = {}
-                if store is not None:
-                    store.begin_step(len(layers) * (fused.KEPT_BYTES_PER_TOKEN_LAYER * n_real +
-                                                    8 * 512) + 2**20)
-                recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
-                                                          cfg.intermediate_size,
-                                                          offloaded=store is not None)
                 cos2 = position_embeddings[0][0].float().contiguous()
                 sin2 = position_embeddings[1][0].float().contiguous()
                 hidden = hidden[0]
                 if not fused.STATE["verified"]:
                     ok = fused.verify_first_layer(layers[0], hidden, ctx, cos2, sin2, weights,
                                                   store)
-                    ctx.handles, ctx.mlp_calls = {}, 0
-                    if store is not None:
-                        store.begin_step(len(layers) * (fused.KEPT_BYTES_PER_TOKEN_LAYER *
-                                                        n_real + 8 * 512) + 2**20)
                     if not ok:  # this and every later step: the per-module path
+                        offload.restore_weights(self)  # the weights back on the GPU, as before
                         _LOCAL.ctx = None
                         return forward(self, input_ids=input_ids, attention_mask=attention_mask,
                                        position_ids=position_ids,
                                        past_key_values=past_key_values,
                                        inputs_embeds=None, use_cache=use_cache, **kwargs)
+                if not fused.STATE["stream"]:
+                    weights = None
+                if not fused.STATE["store"]:
+                    store = None
+                ctx.handles, ctx.mlp_calls = {}, 0
+                if store is not None:
+                    store.begin_step(len(layers) * (fused.KEPT_BYTES_PER_TOKEN_LAYER * n_real +
+                                                    8 * 512) + 2**20)
+                recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
+                                                          cfg.intermediate_size,
+                                                          offloaded=store is not None)
                 for i, layer in enumerate(layers):
                     hidden = fused.run_layer(layer, hidden, ctx, cos2, sin2, i < recompute,
                                              index=i, weights=weights, store=store,

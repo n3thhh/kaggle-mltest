@@ -255,6 +255,12 @@ def _tiny_qlora(seed=0):
     for p in model.parameters():  # as prepare_model_for_kbit_training does
         if p.dtype == torch.float16 and type(p).__name__ != "Params4bit":
             p.data = p.data.float()
+    try:  # peft asks for torchao when a layer is not bnb-dispatched; Kaggle's torchao is too old
+        import peft.tuners.lora.torchao as peft_torchao
+
+        peft_torchao.is_torchao_available = lambda: False
+    except Exception:  # noqa: BLE001
+        pass
     model = get_peft_model(model, LoraConfig(r=8, lora_alpha=16, lora_dropout=0.1,
                                              target_modules=["q_proj", "v_proj"]))
     for name, p in model.named_parameters():

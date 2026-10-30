@@ -804,63 +804,219 @@ def run_layer(layer, hidden, u, cos, sin, recompute_mlp, index=0, weights=None, 
 
 # ================================================================================ self-check
 
-STATE = {"verified": False, "use_fused": True}
+# What the fused path runs with, settled once by verify_first_layer():
+# attention "varlen" (one memory-efficient call with cu_seqlens) or "fallback" (SDPA row by row),
+# saved activations in host memory or not, weights streamed from host memory or fetched per use.
+STATE = {"verified": False, "use_fused": True, "attn": None, "store": True, "stream": True}
+VERIFY_TOKENS = 384  # the self-check runs on the first tokens of the first batch (a few MB)
 
 
 def _rel(a, b):
     return (a.float() - b.float()).abs().max().item() / (b.float().abs().max().item() + 1e-12)
 
 
+def _sub_batch(u, m):
+    """The first `m` tokens of the unpadded batch as a batch of its own: whole rows, then a prefix
+    of the row cut at `m` (causal attention makes a prefix self-contained)."""
+    sub = unpad._Unpadded(u.rows[:m], u.batch, u.seq, m, None)
+    segments, bounds = [], [0]
+    for start, stop in u.segments:
+        if start >= m:
+            break
+        segments.append((start, min(stop, m)))
+        bounds.append(min(stop, m))
+    sub.segments = segments
+    sub.cu_seqlens = torch.tensor(bounds, dtype=torch.int32).to(u.rows.device)
+    sub.max_seqlen = max(stop - start for start, stop in segments)
+    sub.handles = {}
+    return sub
+
+
+class _Fp32Linear(torch.autograd.Function):
+    """y [N, in] fp32 @ w16 [out, in]^T in fp32, keeping only the fp16 weight for backward."""
+
+    @staticmethod
+    def forward(ctx, y, w16):
+        ctx.save_for_backward(w16)
+        return y @ w16.float().t()
+
+    @staticmethod
+    def backward(ctx, grad):
+        (w16,) = ctx.saved_tensors
+        return grad @ w16.float(), None
+
+
+def _reference_fp32(layer, x, u, cos, sin, keep_q, keep_v):
+    """The layer in plain PyTorch, every activation in fp32 (the weights as the fp16 values both
+    runs multiply with): the yardstick for the fused path and for the per-module path."""
+    F = torch.nn.functional
+    attn, mlp = layer.self_attn, layer.mlp
+    qp, kp, vp, op = attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj
+    heads, kv_heads, dim = attn.config.num_attention_heads, attn.config.num_key_value_heads, \
+        attn.head_dim
+    n = x.shape[0]
+
+    def weight(module):
+        return _dequant((module,), torch.float16)
+
+    def norm(h, module):
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + module.variance_epsilon)
+        return module.weight.float() * h
+
+    def rope(t):
+        half = t.shape[-1] // 2
+        rot = torch.cat((-t[..., half:], t[..., :half]), -1)
+        return t * cos[:, None] + rot * sin[:, None]
+
+    def lora(module, y, keep):
+        p = module.lora_dropout["default"].p
+        drop = y * keep.index_select(0, u.rows).to(y.dtype) / (1.0 - p)
+        a, b = module.lora_A["default"].weight.float(), module.lora_B["default"].weight.float()
+        return (drop @ a.t()) @ b.t() * float(module.scaling["default"])
+
+    y = norm(x, layer.input_layernorm)
+    q = _Fp32Linear.apply(y, weight(qp.base_layer)) + qp.base_layer.bias.float() + \
+        lora(qp, y, keep_q)
+    k = _Fp32Linear.apply(y, weight(kp)) + kp.bias.float()
+    v = _Fp32Linear.apply(y, weight(vp.base_layer)) + vp.base_layer.bias.float() + \
+        lora(vp, y, keep_v)
+    q, k = rope(q.view(n, heads, dim)), rope(k.view(n, kv_heads, dim))
+    k = k.repeat_interleave(heads // kv_heads, 1)
+    v = v.view(n, kv_heads, dim).repeat_interleave(heads // kv_heads, 1)
+    outs = [F.scaled_dot_product_attention(
+        q[None, a:b].transpose(1, 2), k[None, a:b].transpose(1, 2), v[None, a:b].transpose(1, 2),
+        is_causal=b - a > 1, scale=attn.scaling)[0].transpose(0, 1) for a, b in u.segments]
+    h1 = x + _Fp32Linear.apply(torch.cat(outs, 0).reshape(n, heads * dim), weight(op))
+    y2 = norm(h1, layer.post_attention_layernorm)
+    act = F.silu(_Fp32Linear.apply(y2, weight(mlp.gate_proj))) * \
+        _Fp32Linear.apply(y2, weight(mlp.up_proj))
+    return h1 + _Fp32Linear.apply(act, weight(mlp.down_proj))
+
+
+def _errors(out, grads, truth, truth_grads, x, grad):
+    names = ("output", "input grad", "lora_A q", "lora_B q", "lora_A v", "lora_B v")
+    values = [_rel(out - x, truth - x), _rel(grads[0] - grad, truth_grads[0] - grad)]
+    values += [_rel(a, b) if b.abs().max().item() > 0 else (a.abs().max().item() > 0) * 1.0
+               for a, b in zip(grads[1:], truth_grads[1:])]
+    return dict(zip(names, values))
+
+
 def verify_first_layer(layer, x, u, cos, sin, weights, store):
-    """Once, at the first training step: layer 0 through the fused path (with the weight stream
-    and the activation store) against the per-module path the earlier versions used, forward and
-    backward, on the step's own batch. Any difference beyond fp16 rounding, or any error, and the
-    run keeps the per-module path. The RNG state is restored, so the step draws what it would
-    have drawn."""
+    """Once, at the first training step, on the first tokens of its batch: layer 0 through the
+    fused path, and through the per-module path the base run's numerics follow, each compared
+    with the same layer computed in fp32 (forward output, input gradient, the four LoRA
+    gradients). The fused path passes when it is at least about as close to fp32 as the
+    per-module path is: the first layers of Qwen2.5 have very large q/k biases, which makes the
+    q and k gradients of any fp16 attention noticeably inexact, so a fixed tolerance against the
+    fp16 per-module path would reject a correct kernel.
+
+    Configurations are tried from the fastest/smallest down: variable-length attention or SDPA
+    row by row, saved activations in host memory or on the GPU, weights streamed or fetched per
+    use. The first one that passes is kept (STATE); if none does, the run keeps the per-module
+    path. The CUDA RNG state is restored, so the step draws what it would have drawn."""
     import sys
 
     STATE["verified"] = True
     if x.device.type != "cuda":
+        STATE["attn"] = _Attention.mode or "fallback"
         return True
     device = x.device
     state = torch.cuda.get_rng_state(device)
+    saved_ctx = unpad._ctx()
+    log = []
     try:
+        if _Attention.mode is None:
+            _self_check(device, layer.self_attn.config.num_attention_heads,
+                        layer.self_attn.head_dim, torch.float16)
+        varlen_ok = _Attention.mode == "varlen"
+        m = min(x.shape[0], VERIFY_TOKENS)
+        sub = _sub_batch(u, m)
+        cos, sin = cos[:m].contiguous(), sin[:m].contiguous()
         gen = torch.Generator(device=device)
         gen.manual_seed(4321)
-        xin = x.detach().clone().requires_grad_(True)
+        xin = x[:m].detach().clone().requires_grad_(True)
         grad = torch.randn(xin.shape, generator=gen, device=device) * 1e-2
         attn = layer.self_attn
         params = [attn.q_proj.lora_A["default"].weight, attn.q_proj.lora_B["default"].weight,
                   attn.v_proj.lora_A["default"].weight, attn.v_proj.lora_B["default"].weight]
+        p_q = attn.q_proj.lora_dropout["default"].p
+        p_v = attn.v_proj.lora_dropout["default"].p
+
+        # the yardstick: fp32, with the masks the step draws
+        torch.cuda.set_rng_state(state, device)
+        probe = torch.empty((1, xin.shape[1]), dtype=torch.float32, device=device)
+        keep_q, keep_v = _masks(sub, probe, p_q, p_v)
+        with torch.autocast("cuda", enabled=False):
+            truth = _reference_fp32(layer, xin, sub, cos, sin, keep_q, keep_v)
+            truth_grads = torch.autograd.grad(truth, [xin] + params, grad)
+        truth = truth.detach()
+        del keep_q, keep_v
+
+        # the per-module path (fp16, as the base run computes)
+        unpad._LOCAL.ctx = sub
         torch.cuda.set_rng_state(state, device)
         ref = layer(xin[None], attention_mask=None, position_embeddings=(cos[None], sin[None]),
                     position_ids=None, past_key_values=None, use_cache=False)
         ref = (ref[0] if isinstance(ref, tuple) else ref)[0]
         ref_grads = torch.autograd.grad(ref, [xin] + params, grad)
-        torch.cuda.set_rng_state(state, device)
-        out = run_layer(layer, xin, u, cos, sin, True, index=0, weights=weights, store=store,
-                        last=False)
-        grads = torch.autograd.grad(out, [xin] + params, grad)
-        checks = [("output", _rel(out - xin, ref - xin), 3e-2),
-                  ("input grad", _rel(grads[0] - grad, ref_grads[0] - grad), 5e-2)]
-        for name, a, b in zip(("lora_A q", "lora_B q", "lora_A v", "lora_B v"), grads[1:],
-                              ref_grads[1:]):
-            checks.append((name, _rel(a, b), 5e-2))
-        bad = [f"{name} {value:.1e}" for name, value, limit in checks
-               if not value <= limit]
-        print("[solution] fused layer self-check: " +
-              ", ".join(f"{name} {value:.1e}" for name, value, _ in checks), file=sys.stderr)
-        if bad:
-            print(f"[solution] fused layer differs ({', '.join(bad)}): per-module path",
-                  file=sys.stderr)
+        unpad._LOCAL.ctx = saved_ctx
+        base = _errors(ref.detach(), ref_grads, truth, truth_grads, xin, grad)
+        del ref, ref_grads
+        log.append("per-module " + ", ".join(f"{k} {v:.1e}" for k, v in base.items()))
+        limits = {"output": 3e-2, "input grad": 5e-2, "lora_A q": 5e-2, "lora_B q": 5e-2,
+                  "lora_A v": 5e-2, "lora_B v": 5e-2}
+        allowed = {k: max(limits[k], 2.0 * base[k] + 1e-3) for k in limits}
+
+        configs = []
+        for mode in (["varlen"] if varlen_ok else []) + ["fallback"]:
+            for keep_host in ([True, False] if store is not None else [False]):
+                configs.append((mode, keep_host, weights is not None))
+        if weights is not None:
+            configs.append(("fallback", False, False))
+        chosen = None
+        for mode, keep_host, stream in configs:
+            name = f"{mode} attention, activations {'host' if keep_host else 'GPU'}, " \
+                   f"weights {'streamed' if stream else 'fetched'}"
+            try:
+                _Attention.mode = mode
+                sub.handles = {}
+                if keep_host:
+                    store.begin_step(KEPT_BYTES_PER_TOKEN_LAYER * m + 2**20)
+                torch.cuda.set_rng_state(state, device)
+                out = run_layer(layer, xin, sub, cos, sin, True, index=0,
+                                weights=weights if stream else None,
+                                store=store if keep_host else None, last=False)
+                grads = torch.autograd.grad(out, [xin] + params, grad)
+                errs = _errors(out.detach(), grads, truth, truth_grads, xin, grad)
+                del out, grads
+                bad = [k for k in errs if not errs[k] <= allowed[k]]
+                log.append(f"fused ({name}) " + ", ".join(f"{k} {v:.1e}" for k, v in errs.items())
+                           + (f" -> differs: {', '.join(bad)}" if bad else " -> ok"))
+                if not bad:
+                    chosen = (mode, keep_host, stream)
+                    break
+            except Exception as exc:  # noqa: BLE001
+                log.append(f"fused ({name}) failed: {exc!r}")
+        if chosen is None:
             STATE["use_fused"] = False
+            _Attention.mode = "varlen" if varlen_ok else "fallback"
+            log.append("no fused configuration matched: per-module path")
+        else:
+            STATE["attn"], STATE["store"], STATE["stream"] = chosen
+            _Attention.mode = chosen[0]
+            log.append(f"fused path: {chosen[0]} attention, activations "
+                       f"{'in host memory' if chosen[1] else 'on the GPU'}, weights "
+                       f"{'streamed' if chosen[2] else 'fetched per use'}")
     except Exception as exc:  # noqa: BLE001
         import traceback
 
         traceback.print_exc()
-        print(f"[solution] fused layer self-check failed ({exc!r}): per-module path",
-              file=sys.stderr)
+        log.append(f"self-check failed ({exc!r}): per-module path")
         STATE["use_fused"] = False
     finally:
+        unpad._LOCAL.ctx = saved_ctx
         torch.cuda.set_rng_state(state, device)
+        torch.cuda.empty_cache()  # the check's fp32 copies must not stay reserved
+    for line in log:
+        print(f"[solution] fused layer self-check: {line}", file=sys.stderr)
     return STATE["use_fused"]

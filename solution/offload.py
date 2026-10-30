@@ -302,6 +302,18 @@ def layer_quant_states(layer):
     return [m.weight.quant_state for m in modules]
 
 
+def restore_weights(root):
+    """Every offloaded 4-bit weight under `root` back on the GPU (the per-module path's
+    fallback when the fused layer is not used: weights fetched per use would be slow)."""
+    for module in root.modules():
+        weight = getattr(module, "weight", None)
+        qs = getattr(weight, "quant_state", None)
+        if qs is not None and is_offloaded(qs) and weight.is_cuda:
+            weight.data = qs._soup_host.to(weight.device).view(weight.shape)
+            qs._soup_host = qs._soup_host_absmax = None
+    _STATE.clear()
+
+
 _ACTS = {}
 
 
