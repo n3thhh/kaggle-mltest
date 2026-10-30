@@ -11,11 +11,10 @@ before Soup builds the model and the trainer.
 - `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
 - `warmup.py`    our kernels compile while the model loads, not in the first step
 - `rope.py`      rotary embedding + fp16 cast + k/v expansion for attention, one kernel each way
-- `mlp.py`       the MLP keeps only its fp16 input and recomputes gate/up in the backward pass
+- `mlp.py`       in long batches the MLP keeps only its fp16 input and recomputes gate/up
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 """
 
-import os
 import sys
 
 from .swiglu import patch_qwen2_mlp
@@ -35,10 +34,9 @@ def apply():
     from .unpad import patch_dropout, patch_qwen2_attention, patch_qwen2_model
 
     _try("example SwiGLU", patch_qwen2_mlp)
-    if os.environ.get("SOUP_SOLUTION_MLP_RECOMPUTE", "1") == "1":  # A/B switch while developing
-        from .mlp import patch_qwen2_mlp_recompute
+    from .mlp import patch_qwen2_mlp_recompute
 
-        _try("MLP with recomputed activations", patch_qwen2_mlp_recompute)
+    _try("MLP recomputing its activations in long batches", patch_qwen2_mlp_recompute)
     _try("NF4 dequantization", patch_bnb_matmul_4bit)
     _try("4-bit linear layers in fp16", patch_linear4bit)
     _try("RMSNorm", patch_qwen2_rmsnorm)

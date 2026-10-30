@@ -38,6 +38,8 @@ class _Unpadded:
         # [(start, stop)] of each row's tokens in the unpadded order when every row's real tokens
         # are one contiguous run (right or left padding); None otherwise.
         self.segments = segments
+        self.mlp_calls = 0          # MLP layers run so far in this forward pass (mlp.py)
+        self.recompute_layers = 0   # how many of them recompute their activations (mlp.py)
 
 
 # --- LoRA dropout with the base run's masks ----------------------------------------------------
@@ -267,7 +269,14 @@ def patch_qwen2_model():
         hidden = inputs_embeds.reshape(batch * seq, -1).index_select(0, rows).unsqueeze(0)
         position_embeddings = (cos[0].index_select(0, token_pos).unsqueeze(0),
                                sin[0].index_select(0, token_pos).unsqueeze(0))
-        _LOCAL.ctx = _Unpadded(rows, batch, seq, n_real, _segments(attention_mask, self.config))
+        ctx = _Unpadded(rows, batch, seq, n_real, _segments(attention_mask, self.config))
+        from .mlp import layers_to_recompute
+
+        cfg = self.config
+        ctx.recompute_layers = layers_to_recompute(n_real, cfg.num_hidden_layers,
+                                                   cfg.intermediate_size, cfg.hidden_size)
+        LAST_TOKENS = (n_real, batch * seq, ctx.recompute_layers)
+        _LOCAL.ctx = ctx
         try:
             for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
                 hidden = layer(hidden, attention_mask=masks[self.config.layer_types[i]],

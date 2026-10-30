@@ -13,6 +13,8 @@ Every product is the one the unfused layers compute (same fp16 weights, same F.l
 example's SwiGLU kernels for silu(gate) * up and its gradient), so the values are unchanged.
 """
 
+import math
+
 import torch
 
 from . import swiglu as example
@@ -87,6 +89,37 @@ def _usable(layer, rows, in_features, device_index):
                                            device_index)
 
 
+# Which layers recompute. The step's memory peak is set by its longest batches only, so short
+# batches keep gate/up (no extra work) and long ones recompute in as many layers as it takes to
+# keep the activations a step holds under ACT_BUDGET_MB. What else a step keeps per real token
+# (norm inputs, attention, LoRA inputs, dropout masks, the head's chunk) was measured on this run:
+# about 1.14 MB over all 28 layers. Keeping a layer's gate and up instead of its fp16 input costs
+# (2 * intermediate - hidden) * 2 bytes per token.
+ACT_BUDGET_MB = 1650.0
+OTHER_MB_PER_TOKEN = 1.14
+
+
+def layers_to_recompute(n_tokens, n_layers, intermediate, hidden):
+    per_layer = n_tokens * (4 * intermediate - 2 * hidden) / 2**20  # MB to keep gate/up instead
+    room = ACT_BUDGET_MB - OTHER_MB_PER_TOKEN * n_tokens
+    excess = per_layer * n_layers - max(room, 0.0)
+    if excess <= 0:
+        return 0
+    return min(n_layers, math.ceil(excess / per_layer))
+
+
+def _should_recompute():
+    """Per MLP call of this forward pass: recompute in the first k layers of the step."""
+    from . import unpad
+
+    ctx = unpad._ctx()
+    if ctx is None:
+        return True  # not an unpadded step of ours: be conservative
+    index = ctx.mlp_calls
+    ctx.mlp_calls += 1
+    return index < ctx.recompute_layers
+
+
 def patch_qwen2_mlp_recompute():
     from transformers.models.qwen2 import modeling_qwen2
 
@@ -100,7 +133,8 @@ def patch_qwen2_mlp_recompute():
                 torch.get_autocast_dtype("cuda") != torch.float16 or \
                 getattr(getattr(self, "config", None), "hidden_act", "silu") != "silu" or \
                 not torch.is_grad_enabled() or \
-                x.dtype not in (torch.float16, torch.float32) or x.numel() == 0:
+                x.dtype not in (torch.float16, torch.float32) or x.numel() == 0 or \
+                not _should_recompute():
             return previous(self, x)
         rows, dev = x.numel() // x.shape[-1], x.device.index
         if not _usable(self.gate_proj, rows, x.shape[-1], dev) or \
