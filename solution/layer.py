@@ -563,7 +563,11 @@ class FusedDecoderLayer(torch.autograd.Function):
         inter = gu.shape[1] // 2
         act = torch.empty((n, inter), dtype=dtype, device=x.device)
         gate_up_act_fwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](gu, act, inter, BLOCK=ACT_BLOCK)
-        if spec.recompute_mlp:
+        # gate|up (35 KB per token) is not kept on the GPU in "recompute" layers: with the
+        # activation store it goes to host memory with the rest (the copy engines are idle
+        # enough), otherwise the backward pass recomputes it (one more large GEMM).
+        gu_host = spec.recompute_mlp and spec.store is not None and not spec.last and OFFLOAD_MLP
+        if spec.recompute_mlp and not gu_host:
             del gu
             gu = None
         d16 = torch.mm(act, _dequant((mlp.down_proj,), dtype, w_d).t())
@@ -578,18 +582,20 @@ class FusedDecoderLayer(torch.autograd.Function):
         # Kept for the backward pass: x (fp32) and attention's output; q, k, v and o16 are
         # recomputed there from them (one q|k|v and one o GEMM, a few % of the layer's work) so
         # that 9 KB per token cross PCIe each way instead of 16 KB.
-        big = [x, out]
+        ctx.gu_host = gu_host
+        big = [x, out, gu] if gu_host else [x, out]
         if spec.store is not None and not spec.last:  # the last layer's are needed first
             ctx.handle = spec.store.save(big)
             spec.u.handles[spec.index] = ctx.handle
             big = [rstd2] * len(big)  # placeholders: the tensors travel to host memory
-        ctx.save_for_backward(*big, a_q, a_v, rstd1, rstd2,
-                              gu if gu is not None else rstd2, aq_w, bq_w, av_w, bv_w)
+        if not gu_host:
+            big.append(gu if gu is not None else rstd2)
+        ctx.save_for_backward(*big, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w)
         return h2
 
     @staticmethod
     def backward(ctx, dh2):
-        (x, out, a_q, a_v, rstd1, rstd2, gu, aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
+        (x, out, gu, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
         spec, u, dtype = ctx.spec, ctx.spec.u, ctx.spec.dtype
         if spec.store is not None:
             if ctx.handle is not None:
@@ -597,8 +603,13 @@ class FusedDecoderLayer(torch.autograd.Function):
             if spec.index > 0:  # the next layer of the backward pass, while this one computes
                 spec.store.prefetch(u.handles.get(spec.index - 1))
             if ctx.handle is not None:
-                x, out = spec.store.load(ctx.handle)
+                loaded = spec.store.load(ctx.handle)
+                x, out = loaded[0], loaded[1]
+                if ctx.gu_host:
+                    gu = loaded[2]
+                del loaded
                 ctx.handle = None
+        recompute = spec.recompute_mlp and not ctx.gu_host
         ws = spec.weights.acquire(spec.index, spec.index - 1) if spec.weights else None
         w_qkv, w_o, w_gu, w_d = (ws[0:3], ws[3:4], ws[4:6], ws[6:7]) if ws else (None,) * 4
         layer = spec.layer
@@ -615,7 +626,7 @@ class FusedDecoderLayer(torch.autograd.Function):
 
         # MLP block
         w_gu_full = None
-        if spec.recompute_mlp:
+        if recompute:
             _, y2, _ = _norm(x, o16, norm2.weight, float(norm2.variance_epsilon), dtype, False)
             w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
             gu = torch.mm(y2, w_gu_full.t())
@@ -705,6 +716,13 @@ class FusedDecoderLayer(torch.autograd.Function):
 ACT_BUDGET_MB = 1300.0
 OFFLOAD_ACT_BUDGET_MB = 0.0
 KEPT_BYTES_PER_TOKEN_LAYER = 9 * 1024 + 128
+OFFLOAD_MLP = __import__("os").environ.get("SOUP_SOLUTION_OFFLOAD_MLP", "1") == "1"
+
+
+def host_bytes_per_token_layer(inter):
+    """Pinned host memory one layer's saved tensors take per token (x, attention's output and,
+    with OFFLOAD_MLP, gate|up)."""
+    return KEPT_BYTES_PER_TOKEN_LAYER + (4 * inter if OFFLOAD_MLP else 0)
 
 
 def mlp_layers_to_recompute(n_tokens, n_layers, inter, offloaded=False):
@@ -988,7 +1006,8 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
                 _Attention.mode = mode
                 sub.handles = {}
                 if keep_host:
-                    store.begin_step(KEPT_BYTES_PER_TOKEN_LAYER * m + 2**20)
+                    store.begin_step(host_bytes_per_token_layer(
+                        layer.mlp.config.intermediate_size) * m + 2**20)
                 torch.cuda.set_rng_state(state, device)
                 out = run_layer(layer, xin, sub, cos, sin, True, index=0,
                                 weights=weights if stream else None,

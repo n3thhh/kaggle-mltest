@@ -96,20 +96,24 @@ def _compile_all():
         # the head streamed from host memory (head_stream.py)
         lambda: head_stream.ce_chunk_stats_kernel[(1,)](
             t(head_stream.CHUNK, f16), head_stream.CHUNK, head_stream.CHUNK, 0, t(1, i64),
-            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32),
-            MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, FIRST=True, num_warps=8),
+            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32), 1,
+            MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, FIRST=True, WRITE_E=True,
+            num_warps=8),
         lambda: head_stream.ce_chunk_stats_kernel[(1,)](
             t(head_stream.CHUNK, f16), head_stream.CHUNK, head_stream.CHUNK, 0, t(1, i64),
-            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32),
+            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32), 1,
             MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, FIRST=False,
-            num_warps=8),
+            WRITE_E=True, num_warps=8),
         lambda: head_stream.ce_finalize_kernel[(1,)](
             t(1, i64), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32),
             t(1, f32), t(1, torch.int32), t(1, f32), 1, BLOCK=1024),
-        lambda: head_stream.ce_chunk_grad_kernel[(1,)](
-            t(head_stream.CHUNK, f16), head_stream.CHUNK, head_stream.CHUNK, 0, t(1, i64),
-            t(1, f32), 1.0, MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK,
-            num_warps=8),
+        lambda: head_stream.rescale_add_kernel[(1,)](
+            t(H, f32), t(H, f16), t(1, f32), HIDDEN=H, BLOCK_H=2048),
+        lambda: head_stream.target_rows_kernel[(1,)](
+            t(H, f16), 1, 0, t(1, i64), t(H, f16), HIDDEN=H, BLOCK_H=2048),
+        lambda: head_stream.ce_grad_finalize_kernel[(1,)](
+            t(H, f32), t(H, f16), t(1, f32), t(1, f32), t(1, f32), 1, 4096.0, HIDDEN=H,
+            BLOCK_H=2048),
     ]
     def host_memory():
         # pinned host memory for saved activations, sized for the longest batch (4 x 512)
@@ -117,8 +121,8 @@ def _compile_all():
 
         store = offload.activation_store(dev)
         if store is not None and store.arena is None:
-            store.arena = torch.empty(28 * (layer.KEPT_BYTES_PER_TOKEN_LAYER * 2048 + 8 * 512) +
-                                      2**20, dtype=torch.uint8, pin_memory=True)
+            store.arena = torch.empty(28 * (layer.host_bytes_per_token_layer(INTER) * 2048 +
+                                            8 * 512) + 2**20, dtype=torch.uint8, pin_memory=True)
 
     jobs.append(host_memory)
     import time

@@ -34,6 +34,9 @@ def _try(name, patch):
 
 
 def apply():
+    from .warmup import start
+
+    _try("kernel warm-up", start)  # first: our kernels compile while everything else loads
     from .imports import import_trl
 
     _try("one package-metadata scan", import_trl)  # before anything of ours imports TRL
@@ -55,11 +58,9 @@ def apply():
     _try("padding-free attention", patch_qwen2_attention)
     _try("LoRA dropout with the base masks", patch_dropout)
     from .embed import patch_embedding, patch_prepare_kbit
-    from .warmup import start
 
     _try("fp16 tied embedding", patch_embedding)
     _try("tied embedding kept fp16 at load", patch_prepare_kbit)
-    _try("kernel warm-up", start)  # compiles our kernels while Soup loads the model
     from . import offload
 
     if offload.ENABLED:  # before the model is loaded: weights go to host memory as quantized

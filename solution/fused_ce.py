@@ -34,6 +34,7 @@ VOCAB_BLOCK = 2048
 # true gradient is recovered in fp32 in the backward pass. It keeps small probabilities above the
 # fp16 subnormal range (the base gets the same from the loss scaler) without risking overflow.
 GRAD_SCALE = 4096.0
+_FIRST = {"done": False}
 STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder reads a step without logits
 _ALLOW_CPU = False  # tests only: run the fused path on CPU tensors (TRITON_INTERPRET=1)
 
@@ -345,6 +346,12 @@ def patch_sft_trainer():
         from .embed import shrink_tied_embedding
         from .warmup import wait
 
+        first = not _FIRST["done"]
+        if first:
+            import time
+
+            _FIRST["done"] = True
+            t0 = time.perf_counter()
         wait()  # our kernels finished compiling while the model loaded
         if getattr(self.args, "fp16", False):
             shrink_tied_embedding(self, _causal_lm_of(model))
@@ -357,6 +364,13 @@ def patch_sft_trainer():
                 self, model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
         finally:
             _LOCAL.capture = None
+        if first:
+            import sys
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[solution] first step: forward pass and loss {time.perf_counter() - t0:.2f} s "
+                  "(with the warm-up wait and the self-checks)", file=sys.stderr)
         step = capture.step
         if step is None:  # the model took its own path and returned logits
             step = _step_from_logits(outputs.logits, inputs["labels"])
