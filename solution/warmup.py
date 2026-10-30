@@ -141,14 +141,36 @@ def _compile_all(offline=False, part=0, parts=1):
         TIMES["start"] = time.perf_counter()
         _wait_helpers()
         TIMES["helpers_done"] = time.perf_counter()
-    for job in jobs:
+        _count_cache_hits()
+    for i, job in enumerate(jobs):
+        began = time.perf_counter()
         try:
             job()
         except Exception as exc:  # noqa: BLE001 - a kernel not warmed up compiles at first use
             if not offline:
                 TIMES.setdefault("errors", []).append(repr(exc)[:200])
+        if not offline:
+            TIMES.setdefault("jobs", []).append((round(time.perf_counter() - began, 2), i))
     if not offline:
         TIMES["done"] = time.perf_counter()
+
+
+def _count_cache_hits():
+    """Count Triton's compile-cache hits and misses in this process (for the log)."""
+    try:
+        from triton import knobs
+
+        previous = knobs.compilation.listener
+        counts = TIMES.setdefault("cache", {"hit": 0, "miss": 0})
+
+        def listener(*args, **kwargs):
+            counts["hit" if kwargs.get("cache_hit") else "miss"] += 1
+            if previous is not None:
+                previous(*args, **kwargs)
+
+        knobs.compilation.listener = listener
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- compiling in helper processes --------------------------------------------------------------
@@ -257,6 +279,8 @@ def wait():
         start, done = TIMES.get("start"), TIMES.get("done")
         print(f"[solution] kernel warm-up: {done - start:.2f} s in the background (helper "
               f"processes {TIMES.get('helpers')}: {TIMES.get('helpers_done', start) - start:.2f} s),"
-              f" the first step waited {TIMES['waited']:.2f} s, errors: {TIMES.get('errors', [])}"
+              f" the first step waited {TIMES['waited']:.2f} s, compile cache {TIMES.get('cache')},"
+              f" slowest jobs {sorted(TIMES.get('jobs', []), reverse=True)[:6]},"
+              f" errors: {TIMES.get('errors', [])}"
               if start is not None and done is not None else
               f"[solution] kernel warm-up: unfinished ({TIMES})", file=sys.stderr)
