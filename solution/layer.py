@@ -502,6 +502,18 @@ def _self_check(device, heads, dim, dtype):
 
 # ================================================================================ the layer
 
+MEMORY = {}  # phase -> (largest allocated, largest reserved) in MiB, sampled (for the log)
+
+
+def sample_memory(phase, device):
+    if device.type != "cuda":
+        return
+    allocated = torch.cuda.memory_allocated(device) / 2**20
+    reserved = torch.cuda.memory_reserved(device) / 2**20
+    old = MEMORY.get(phase, (0.0, 0.0))
+    MEMORY[phase] = (max(old[0], allocated), max(old[1], reserved))
+
+
 class LayerSpec:
     """What a layer's autograd function needs besides tensors."""
 
@@ -553,6 +565,10 @@ class FusedDecoderLayer(torch.autograd.Function):
         del qkv, l_q, l_v
         out, aux = _Attention.forward(qe, ke, ve, u, attn.scaling)
         del qe, ke, ve, kc, vc
+        # What the backward pass needs goes to host memory as soon as it exists, so the copies
+        # run while the rest of the layer computes and the GPU copies are released early.
+        offload = spec.store is not None and not spec.last  # the last layer's are needed first
+        handle = spec.store.save([x, out]) if offload else None
         o16 = torch.mm(out.reshape(n, heads * dim), _dequant((op,), dtype, w_o).t())
 
         # MLP block
@@ -566,12 +582,14 @@ class FusedDecoderLayer(torch.autograd.Function):
         # gate|up (35 KB per token) is not kept on the GPU in "recompute" layers: with the
         # activation store it goes to host memory with the rest (the copy engines are idle
         # enough), otherwise the backward pass recomputes it (one more large GEMM).
-        gu_host = spec.recompute_mlp and spec.store is not None and not spec.last and \
-            mlp_to_host(spec.index)
-        if spec.recompute_mlp and not gu_host:
+        gu_host = spec.recompute_mlp and offload and mlp_to_host(spec.index)
+        if gu_host:
+            spec.store.save([gu], handle)
+        if spec.recompute_mlp or gu_host:
             del gu
             gu = None
         d16 = torch.mm(act, _dequant((mlp.down_proj,), dtype, w_d).t())
+        sample_memory("layer forward", x.device)
         del act
         h2 = x + o16  # the residual stream after attention, in fp32 as in the base run
         h2 += d16
@@ -579,18 +597,18 @@ class FusedDecoderLayer(torch.autograd.Function):
         ctx.spec, ctx.rng = spec, rng
         ctx.consts = (p_q, p_v, s_q, s_v, heads, kv_heads, dim, inter)
         ctx.aux = aux
-        ctx.handle = None
         # Kept for the backward pass: x (fp32) and attention's output; q, k, v and o16 are
         # recomputed there from them (one q|k|v and one o GEMM, a few % of the layer's work) so
-        # that 9 KB per token cross PCIe each way instead of 16 KB.
+        # that 9 KB per token cross PCIe each way instead of 16 KB. gate|up: on the GPU, in
+        # host memory, or recomputed.
         ctx.gu_host = gu_host
-        big = [x, out, gu] if gu_host else [x, out]
-        if spec.store is not None and not spec.last:  # the last layer's are needed first
-            ctx.handle = spec.store.save(big)
-            spec.u.handles[spec.index] = ctx.handle
-            big = [rstd2] * len(big)  # placeholders: the tensors travel to host memory
-        if not gu_host:
-            big.append(gu if gu is not None else rstd2)
+        ctx.handle = handle
+        if offload:
+            spec.u.handles[spec.index] = handle
+            big = [rstd2, rstd2]  # placeholders: the tensors travel to host memory
+        else:
+            big = [x, out]
+        big.append(gu if gu is not None else rstd2)
         ctx.save_for_backward(*big, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w)
         return h2
 
@@ -640,6 +658,7 @@ class FusedDecoderLayer(torch.autograd.Function):
         if w_gu_full is None:
             w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
         dy2 = torch.mm(d_gu, w_gu_full)
+        sample_memory("layer backward", x.device)
         del d_gu, w_gu_full
         dh1 = _norm_bwd(dy2, None, None, None, None, u.rows, x, o16, norm2.weight, rstd2, dh2,
                         1.0, 1.0)
@@ -678,6 +697,7 @@ class FusedDecoderLayer(torch.autograd.Function):
         d_out = torch.mm(dh1.to(dtype), wo).view(n, heads, dim)
         del wo
         dqe, dke, dve = _Attention.backward(d_out, qe, ke, ve, out, ctx.aux, u, attn.scaling)
+        sample_memory("layer backward (attention)", x.device)
         del d_out, qe, ke, ve, out
         qkv_cols = (heads + 2 * kv_heads) * dim
         d_qkv = torch.empty((n, qkv_cols), dtype=dtype, device=x.device)

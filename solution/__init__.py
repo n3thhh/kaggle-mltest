@@ -113,5 +113,15 @@ def _timeline():
             return train(self, *args, **kwargs)
         finally:
             mark("trainer: train() done")
+            try:
+                from .layer import MEMORY
+                from .unpad import _MAX_TOKENS
+
+                print(f"[solution] longest step {_MAX_TOKENS[0]} tokens; GPU memory per phase "
+                      "(MiB allocated / reserved): " + ", ".join(
+                          f"{k} {a:.0f}/{r:.0f}" for k, (a, r) in MEMORY.items()),
+                      file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
 
     trainer_cls.__init__, trainer_cls.train = traced_init, traced_train

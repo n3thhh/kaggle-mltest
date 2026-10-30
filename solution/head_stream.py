@@ -246,6 +246,9 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
             rescale_add_kernel[(k,)](grad, part16, alpha, HIDDEN=hidden_size, BLOCK_H=block_h)
             target_rows_kernel[(k,)](w, c1 - c0, c0, targets, wt, HIDDEN=hidden_size,
                                      BLOCK_H=block_h)
+    from .layer import sample_memory
+
+    sample_memory("head", device)
     ce_finalize_kernel[(triton.cdiv(n, 1024),)](targets, m, s, d, bidx, tlogit, entropy,
                                                 token_loss, correct, lse, n, BLOCK=1024)
     if k > 0:

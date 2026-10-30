@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 _LOCAL = threading.local()
+_MAX_TOKENS = [0]  # the longest step (real tokens), for the log
 _ALLOW_CPU = False  # tests only: run on CPU tensors (TRITON_INTERPRET=1)
 
 
@@ -247,6 +248,7 @@ def patch_qwen2_model():
         batch, seq = input_ids.shape
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
         n_real = rows.numel()  # one sync, as TRL's own .item() calls on the mask
+        _MAX_TOKENS[0] = max(_MAX_TOKENS[0], n_real)
         if n_real == batch * seq or n_real == 0:
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
@@ -314,6 +316,7 @@ def patch_qwen2_model():
                 recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
                                                           cfg.intermediate_size,
                                                           offloaded=store is not None)
+                fused.sample_memory("decoder start", rows.device)
                 for i, layer in enumerate(layers):
                     hidden = fused.run_layer(layer, hidden, ctx, cos2, sin2, i < recompute,
                                              index=i, weights=weights, store=store,

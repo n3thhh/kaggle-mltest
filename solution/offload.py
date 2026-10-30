@@ -237,8 +237,8 @@ class ActivationStore:
         # the previous step's last host-to-device reads must finish before this step writes
         self.d2h.wait_stream(self.h2d)
 
-    def save(self, tensors):
-        """Start copying `tensors` (GPU) to host; returns a handle."""
+    def save(self, tensors, handle=None):
+        """Start copying `tensors` (GPU) to host; returns a handle (or adds them to `handle`)."""
         compute = torch.cuda.current_stream(self.device)
         ready = torch.cuda.Event()
         ready.record(compute)
@@ -255,12 +255,16 @@ class ActivationStore:
                 hosts.append(host)
         done = torch.cuda.Event()
         done.record(self.d2h)
-        # At most two layers' copies in flight: the GPU memory of a tensor being copied is
-        # held until its copy ends, so a backlog would raise the memory peak. Waiting here
-        # (CPU side) costs nothing while the copies keep pace with the layers.
+        # At most two batches of copies in flight (about one layer's): the GPU memory of a
+        # tensor being copied is held until its copy ends, so a backlog would raise the memory
+        # peak. Waiting here (CPU side) costs nothing while the copies keep pace.
         self.in_flight.append(done)
         while len(self.in_flight) > 2:
             self.in_flight.pop(0).synchronize()
+        if handle is not None:
+            handle["hosts"].extend(hosts)
+            handle["d2h"] = done  # the copy stream is in order: this one ends after the rest
+            return handle
         return {"hosts": hosts, "d2h": done, "gpu": None, "h2d": None}
 
     def prefetch(self, handle):
