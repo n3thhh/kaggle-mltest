@@ -11,6 +11,7 @@ The organizers' example kernels, which run in the same steps, are compiled the s
 import threading
 
 _THREAD = None
+TIMES = {}  # when the warm-up started / finished and how long the first step waited (debug log)
 VOCAB = 151936   # Qwen2.5's vocabulary (the head's rows)
 HIDDEN = 1536    # Qwen2.5-1.5B's hidden size
 
@@ -50,11 +51,15 @@ def _compile_all():
             t(8960, f16), t(8960, f16), t(8960, f16), t(8960, f16), t(8960, f16), 8960,
             BLOCK=swiglu.BLOCK, grid=(1,)),
     ]
+    import time
+
+    TIMES["start"] = time.perf_counter()
     for job in jobs:
         try:
             job()
-        except Exception:  # noqa: BLE001 - a kernel not warmed up just compiles at first use
-            pass
+        except Exception as exc:  # noqa: BLE001 - a kernel not warmed up compiles at first use
+            TIMES.setdefault("errors", []).append(repr(exc)[:200])
+    TIMES["done"] = time.perf_counter()
 
 
 def start():
@@ -71,5 +76,9 @@ def start():
 
 
 def wait():
-    if _THREAD is not None:
+    if _THREAD is not None and "waited" not in TIMES:
+        import time
+
+        t0 = time.perf_counter()
         _THREAD.join()
+        TIMES["waited"] = time.perf_counter() - t0

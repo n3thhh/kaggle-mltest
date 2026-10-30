@@ -90,32 +90,39 @@ class NF4Linear(torch.autograd.Function):
         return grad_x, None, None, grad_bias
 
 
-def _base_uses_fused_kernel(x, quant_state, dtype=None):
-    """True where bitsandbytes' CUDA backend would run its own fused 4-bit GEMM for this batch
-    (small M); there we keep its path so the numerics stay those of the base run."""
+def _base_uses_fused_kernel_for(m, k, quant_state, dtype, device_index):
+    """True where bitsandbytes' CUDA backend would run its own fused 4-bit GEMM for an [m, k]
+    input (small m); there we keep its path so the numerics stay those of the base run."""
     try:
         from bitsandbytes.backends.cuda import ops as cuda_ops
     except Exception:  # noqa: BLE001 - no such backend: nothing to defer to
         return False
-    k = x.shape[-1]
-    m = x.numel() // k
     n = quant_state.shape[0]
     try:
         if m > cuda_ops._gemm_4bit_custom_max_m or k % quant_state.blocksize != 0:
             return False
-        return bool(cuda_ops._gemm_4bit_use_custom_fn(x.device.index, dtype or x.dtype, m, n, k))
+        return bool(cuda_ops._gemm_4bit_use_custom_fn(device_index, dtype, m, n, k))
     except Exception:  # noqa: BLE001 - a different bitsandbytes: be conservative
         return True
 
 
-def _supported(x, packed, quant_state):
-    return (quant_state is not None and x.is_cuda and x.numel() > 0
-            and x.dtype in (torch.float16, torch.float32)
-            and quant_state.quant_type == "nf4" and len(quant_state.shape) == 2
-            and x.shape[-1] == quant_state.shape[1]
+def _base_uses_fused_kernel(x, quant_state, dtype=None):
+    k = x.shape[-1]
+    return _base_uses_fused_kernel_for(x.numel() // k, k, quant_state, dtype or x.dtype,
+                                       x.device.index)
+
+
+def _nf4_state_ok(packed, quant_state, in_features):
+    return (quant_state is not None and quant_state.quant_type == "nf4"
+            and len(quant_state.shape) == 2 and quant_state.shape[1] == in_features
             and quant_state.blocksize % 2 == 0
             and (not quant_state.nested or quant_state.state2.blocksize == 256)
             and packed.dtype == torch.uint8 and packed.is_contiguous())
+
+
+def _supported(x, packed, quant_state):
+    return (x.is_cuda and x.numel() > 0 and x.dtype in (torch.float16, torch.float32)
+            and _nf4_state_ok(packed, quant_state, x.shape[-1]))
 
 
 def _gemm_dtype(module, x):

@@ -84,11 +84,30 @@ class _RowDropout(torch.autograd.Function):
         return out.view(ctx.shape), None, None, None
 
 
+_ONES = {}
+
+
+def _ones(numel, dtype, device):
+    """A reusable all-ones buffer (only its size matters to the random draw)."""
+    key = (dtype, device)
+    buf = _ONES.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = torch.ones(max(numel, 1), dtype=dtype, device=device)
+        _ONES[key] = buf
+    return buf[:numel]
+
+
 def _padded_dropout_keep(ctx, x, p):
-    """The keep mask the base run's dropout would draw on the padded [B, T, hidden] input: the
-    same call on a tensor of that shape and dtype draws the same random numbers."""
-    probe = torch.ones((ctx.batch, ctx.seq, x.shape[-1]), dtype=x.dtype, device=x.device)
-    return torch.nn.functional.dropout(probe, p, True).ne_(0).view(ctx.batch * ctx.seq, -1)
+    """The boolean keep mask the base run's dropout draws on the padded [B, T, hidden] input.
+    On CUDA, F.dropout is at::native_dropout; calling it on a tensor of the same size and dtype
+    draws the same random numbers, and it hands back the mask as bool directly."""
+    numel = ctx.batch * ctx.seq * x.shape[-1]
+    if x.is_cuda:
+        _, keep = torch.native_dropout(_ones(numel, x.dtype, x.device), p, True)
+    else:  # CPU (tests): F.dropout takes the bernoulli path there
+        probe = torch.ones(numel, dtype=x.dtype, device=x.device)
+        keep = torch.nn.functional.dropout(probe, p, True) != 0
+    return keep.view(ctx.batch * ctx.seq, -1)
 
 
 def patch_dropout():

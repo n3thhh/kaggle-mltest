@@ -29,6 +29,12 @@ def install():
             print(f"[mem] step {state.global_step}: {time.perf_counter() - self.t0:.3f} s, "
                   f"start {self.a0 / 2**20:.0f} MiB, peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, "
                   f"tokens {getattr(unpad, 'LAST_TOKENS', None)}", flush=True)
+            if state.global_step <= 2:
+                from . import warmup
+                t = dict(warmup.TIMES)
+                if "start" in t and "done" in t:
+                    t["compile_s"] = round(t["done"] - t["start"], 2)
+                print(f"[mem] warm-up: {t}", flush=True)
             torch.cuda.reset_peak_memory_stats()
 
     original = transformers.Trainer.__init__
