@@ -143,18 +143,25 @@ def patch_qwen2_attention():
         interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation,
                                                              mq.eager_attention_forward)
         dropout = 0.0 if not self.training else self.attention_dropout
-        if ctx.segments is not None:
+        if ctx.segments is not None and not self.attention_dropout:
             # Each row on its own, causal, with no mask: a real token sees the same keys as under
             # the base run's padding mask (its row's real tokens up to itself), and no work is
-            # spent on padding.
+            # spent on padding. k and v are expanded to all query heads (repeat_kv, as the base
+            # run's masked SDPA call does) so PyTorch keeps its memory-efficient kernel; SDPA
+            # with enable_gqa would fall back to the slow fp32 math kernel on a T4.
+            groups = self.num_key_value_groups
+            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else \
+                query.dtype
+            q = query.to(dtype)
+            k = mq.repeat_kv(key.to(dtype), groups)
+            v = mq.repeat_kv(value.to(dtype), groups)
             outs = []
             for start, stop in ctx.segments:
-                out, _ = interface(self, query[:, :, start:stop], key[:, :, start:stop],
-                                   value[:, :, start:stop], None, dropout=dropout,
-                                   scaling=self.scaling, sliding_window=self.sliding_window,
-                                   **kwargs)
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q[:, :, start:stop], k[:, :, start:stop], v[:, :, start:stop],
+                    is_causal=stop - start > 1, scale=self.scaling)
                 outs.append(out)
-            out = torch.cat(outs, dim=1).reshape(1, n, -1)
+            out = torch.cat(outs, dim=2).transpose(1, 2).reshape(1, n, -1)
             return self.o_proj(out), None
 
         def padded(states):  # [1, heads, N, d] -> [B, heads, T, d]
