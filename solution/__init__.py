@@ -8,6 +8,8 @@ before Soup builds the model and the trainer.
 - `rmsnorm.py`   RMSNorm forward and backward in one kernel each, with the fp16 copy those
                  layers need
 - `unpad.py`     the decoder layers on real tokens only, attention on the padded layout
+- `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
+- `warmup.py`    our kernels compile while the model loads, not in the first step
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 """
 
@@ -38,5 +40,10 @@ def apply():
     _try("padding-free decoder", patch_qwen2_model)
     _try("padding-free attention", patch_qwen2_attention)
     _try("LoRA dropout with the base masks", patch_dropout)
+    from .embed import patch_embedding
+    from .warmup import start
+
+    _try("fp16 tied embedding", patch_embedding)
+    _try("kernel warm-up", start)  # compiles our kernels while Soup loads the model
     from .debug import install
     install()  # does nothing unless SOUP_SOLUTION_DEBUG=1

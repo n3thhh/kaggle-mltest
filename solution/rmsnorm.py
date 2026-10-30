@@ -36,15 +36,19 @@ def rmsnorm_fwd_kernel(x_ptr, w_ptr, y_ptr, half_ptr, rstd_ptr, n_cols, eps, BLO
     tl.store(rstd_ptr + row, rstd)
 
 
-@triton.jit
-def rmsnorm_bwd_kernel(dy_ptr, dhalf_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, n_cols,
-                       BLOCK: tl.constexpr, HAS_DHALF: tl.constexpr):
+@triton.jit(do_not_specialize=["has_dy", "has_dhalf"])
+def rmsnorm_bwd_kernel(dy_ptr, dhalf_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, n_cols, has_dy, has_dhalf,
+                       BLOCK: tl.constexpr):
+    """dx for one row. The gradients of both outputs (the norm and its fp16 copy) add up; either
+    may be missing (runtime flags, so one compiled kernel serves every layer)."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
     x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
-    if HAS_DHALF:  # both outputs were used: their gradients add up
+    dy = tl.zeros([BLOCK], dtype=tl.float32)
+    if has_dy != 0:
+        dy += tl.load(dy_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+    if has_dhalf != 0:
         dy += tl.load(dhalf_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = tl.load(rstd_ptr + row)
@@ -53,6 +57,17 @@ def rmsnorm_bwd_kernel(dy_ptr, dhalf_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, n_cols
     proj = tl.sum(g * x_hat, axis=0) / n_cols
     dx = rstd * (g - x_hat * proj)
     tl.store(dx_ptr + row * n_cols + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
+
+
+_DUMMY = {}
+
+
+def _dummy(dtype, device):
+    """A one-element stand-in for a missing gradient, of the dtype the kernel was compiled for."""
+    key = (dtype, device)
+    if key not in _DUMMY:
+        _DUMMY[key] = torch.zeros(1, dtype=dtype, device=device)
+    return _DUMMY[key]
 
 
 class RMSNorm(torch.autograd.Function):
@@ -77,6 +92,7 @@ class RMSNorm(torch.autograd.Function):
                                       num_warps=warps)
         ctx.save_for_backward(x2, weight, rstd)
         ctx.shape, ctx.block, ctx.warps = shape, block, warps
+        ctx.out_dtype, ctx.half_dtype = out_dtype, (half.dtype if half is not None else None)
         ctx.set_materialize_grads(False)  # an output nobody used gets no zero gradient
         y = y.view(*shape[:-1], n_cols)
         if half is None:
@@ -87,13 +103,15 @@ class RMSNorm(torch.autograd.Function):
     def backward(ctx, dy, dhalf):
         x2, weight, rstd = ctx.saved_tensors
         n_rows, n_cols = x2.shape
-        if dy is None:
-            dy, dhalf = dhalf, None
-        dy2 = dy.reshape(-1, n_cols).contiguous()
-        dh2 = dhalf.reshape(-1, n_cols).contiguous() if dhalf is not None else dy2
+        device = x2.device
+        dy2 = dy.reshape(-1, n_cols).contiguous() if dy is not None else \
+            _dummy(ctx.out_dtype, device)
+        dh2 = dhalf.reshape(-1, n_cols).contiguous() if dhalf is not None else \
+            _dummy(ctx.half_dtype or torch.float16, device)
         dx = torch.empty_like(x2)
-        rmsnorm_bwd_kernel[(n_rows,)](dy2, dh2, x2, weight, rstd, dx, n_cols, BLOCK=ctx.block,
-                                      HAS_DHALF=dhalf is not None, num_warps=ctx.warps)
+        rmsnorm_bwd_kernel[(n_rows,)](dy2, dh2, x2, weight, rstd, dx, n_cols, int(dy is not None),
+                                      int(dhalf is not None), BLOCK=ctx.block,
+                                      num_warps=ctx.warps)
         return dx.view(ctx.shape), None, None, None
 
 

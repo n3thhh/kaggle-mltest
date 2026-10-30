@@ -33,17 +33,21 @@ def _ctx():
 
 
 class _Unpadded:
-    def __init__(self, rows, batch, seq, n_real):
+    def __init__(self, rows, batch, seq, n_real, segments):
         self.rows, self.batch, self.seq, self.n = rows, batch, seq, n_real
+        # [(start, stop)] of each row's tokens in the unpadded order when every row's real tokens
+        # are one contiguous run (right or left padding); None otherwise.
+        self.segments = segments
 
 
 # --- LoRA dropout with the base run's masks ----------------------------------------------------
 
 @triton.jit
-def gather_masked_scale_kernel(x_ptr, keep_ptr, rows_ptr, out_ptr, n_cols, scale,
-                               BLOCK: tl.constexpr):
-    """out[i] = x[i] * keep[rows[i]] * scale, one real-token row per program: the row's slice of
-    a dropout mask drawn over the padded batch, applied to the unpadded activations."""
+def rows_masked_scale_kernel(x_ptr, keep_ptr, rows_ptr, out_ptr, n_cols, scale,
+                             BLOCK: tl.constexpr):
+    """out[i] = x[i] * keep[rows[i]] * scale, one real-token row per program: that row's slice of
+    a dropout mask drawn over the padded batch, applied to the unpadded activations. The backward
+    pass is the same operation on the gradient."""
     row = tl.program_id(0).to(tl.int64)
     src = tl.load(rows_ptr + row).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -51,20 +55,6 @@ def gather_masked_scale_kernel(x_ptr, keep_ptr, rows_ptr, out_ptr, n_cols, scale
     x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0)
     keep = tl.load(keep_ptr + src * n_cols + cols, mask=mask, other=0)
     out = x * keep.to(x.dtype) * scale
-    tl.store(out_ptr + row * n_cols + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def masked_scale_rows_kernel(g_ptr, keep_ptr, rows_ptr, out_ptr, n_cols, scale,
-                             BLOCK: tl.constexpr):
-    """The backward pass of the kernel above: grad * keep[rows[i]] * scale."""
-    row = tl.program_id(0).to(tl.int64)
-    src = tl.load(rows_ptr + row).to(tl.int64)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < n_cols
-    g = tl.load(g_ptr + row * n_cols + cols, mask=mask, other=0.0)
-    keep = tl.load(keep_ptr + src * n_cols + cols, mask=mask, other=0)
-    out = g * keep.to(g.dtype) * scale
     tl.store(out_ptr + row * n_cols + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -78,7 +68,7 @@ class _RowDropout(torch.autograd.Function):
         x2 = x.reshape(-1, n_cols).contiguous()
         out = torch.empty_like(x2)
         grid = (x2.shape[0], triton.cdiv(n_cols, ROW_BLOCK))
-        gather_masked_scale_kernel[grid](x2, keep, rows, out, n_cols, scale, BLOCK=ROW_BLOCK)
+        rows_masked_scale_kernel[grid](x2, keep, rows, out, n_cols, scale, BLOCK=ROW_BLOCK)
         ctx.save_for_backward(keep, rows)
         ctx.scale, ctx.shape = scale, x.shape
         return out.view(x.shape)
@@ -90,7 +80,7 @@ class _RowDropout(torch.autograd.Function):
         g2 = grad.reshape(-1, n_cols).contiguous()
         out = torch.empty_like(g2)
         grid = (g2.shape[0], triton.cdiv(n_cols, ROW_BLOCK))
-        masked_scale_rows_kernel[grid](g2, keep, rows, out, n_cols, ctx.scale, BLOCK=ROW_BLOCK)
+        rows_masked_scale_kernel[grid](g2, keep, rows, out, n_cols, ctx.scale, BLOCK=ROW_BLOCK)
         return out.view(ctx.shape), None, None, None
 
 
@@ -150,13 +140,28 @@ def patch_qwen2_attention():
         cos, sin = position_embeddings
         query, key = mq.apply_rotary_pos_emb(query, key, cos, sin)
 
+        interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation,
+                                                             mq.eager_attention_forward)
+        dropout = 0.0 if not self.training else self.attention_dropout
+        if ctx.segments is not None:
+            # Each row on its own, causal, with no mask: a real token sees the same keys as under
+            # the base run's padding mask (its row's real tokens up to itself), and no work is
+            # spent on padding.
+            outs = []
+            for start, stop in ctx.segments:
+                out, _ = interface(self, query[:, :, start:stop], key[:, :, start:stop],
+                                   value[:, :, start:stop], None, dropout=dropout,
+                                   scaling=self.scaling, sliding_window=self.sliding_window,
+                                   **kwargs)
+                outs.append(out)
+            out = torch.cat(outs, dim=1).reshape(1, n, -1)
+            return self.o_proj(out), None
+
         def padded(states):  # [1, heads, N, d] -> [B, heads, T, d]
             return _scatter(states[0].transpose(0, 1), ctx.rows, ctx.batch, ctx.seq).transpose(1, 2)
 
-        interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation,
-                                                             mq.eager_attention_forward)
         out, weights = interface(self, padded(query), padded(key), padded(value), attention_mask,
-                                 dropout=0.0 if not self.training else self.attention_dropout,
+                                 dropout=dropout,
                                  scaling=self.scaling, sliding_window=self.sliding_window,
                                  **kwargs)
         out = out.reshape(ctx.batch * ctx.seq, -1).index_select(0, ctx.rows).unsqueeze(0)
@@ -164,6 +169,25 @@ def patch_qwen2_attention():
 
     forward._soup_patched = True
     cls.forward = forward
+
+
+def _segments(attention_mask, config):
+    """Each row's run of real tokens in the unpadded order, if every row has one contiguous run
+    and every layer is plain causal full attention; None otherwise (then attention runs padded)."""
+    if getattr(config, "_attn_implementation", None) != "sdpa" or \
+            any(t != "full_attention" for t in getattr(config, "layer_types", None) or []) or \
+            getattr(config, "use_sliding_window", False):
+        return None
+    mask = attention_mask.detach().to("cpu", torch.bool)
+    segments, start = [], 0
+    for row in mask:
+        idx = row.nonzero().flatten()
+        count = idx.numel()
+        if count == 0 or int(idx[-1]) - int(idx[0]) + 1 != count:
+            return None
+        segments.append((start, start + count))
+        start += count
+    return segments
 
 
 def patch_qwen2_model():
@@ -215,7 +239,7 @@ def patch_qwen2_model():
         hidden = inputs_embeds.reshape(batch * seq, -1).index_select(0, rows).unsqueeze(0)
         position_embeddings = (cos[0].index_select(0, token_pos).unsqueeze(0),
                                sin[0].index_select(0, token_pos).unsqueeze(0))
-        _LOCAL.ctx = _Unpadded(rows, batch, seq, n_real)
+        _LOCAL.ctx = _Unpadded(rows, batch, seq, n_real, _segments(attention_mask, self.config))
         try:
             for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
                 hidden = layer(hidden, attention_mask=masks[self.config.layer_types[i]],

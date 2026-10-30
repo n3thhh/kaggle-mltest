@@ -28,7 +28,7 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-ROWS_PER_CHUNK = 1024
+ROWS_PER_CHUNK = 256  # 256 x 151,936 fp16 logits: 78 MB live at a time
 VOCAB_BLOCK = 2048
 # The gradient over the logits is stored scaled by this power of two, in the logits' dtype; the
 # true gradient is recovered in fp32 in the backward pass. It keeps small probabilities above the
@@ -310,6 +310,12 @@ def patch_sft_trainer():
             setattr(self, STEP_ATTR, None)
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
+        from .embed import shrink_tied_embedding
+        from .warmup import wait
+
+        wait()  # our kernels finished compiling while the model loaded
+        if getattr(self.args, "fp16", False):
+            shrink_tied_embedding(self, _causal_lm_of(model))
         inputs.pop("_prediction_loss_only", None)
         inputs["use_cache"] = False
         capture = SimpleNamespace(step=None)
