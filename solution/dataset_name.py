@@ -1,51 +1,52 @@
-"""Soup's tokenization `Dataset.map` without hashing the tokenizer to name its result.
+"""Soup's text SFT rows tokenized by our own loop instead of `Dataset.map`.
 
-`datasets` names the result of every `Dataset.map` by hashing the mapped function with dill, so it
-can find a cached result next time. Soup's text SFT helper (`soup_cli.trainer.sft.
-_map_text_sft_rows`) maps a closure over the chat formatter, which holds the tokenizer: the hash
-serializes its whole 151k-token vocabulary (about 760k Python objects), about 2 s of every
-`soup train` on a Kaggle T4. That helper maps `Dataset.from_list(rows)`, a dataset in memory with
-no cache files, so the name is never used to read or write a cache; Soup and TRL's SFT path never
-read it either. While that helper runs, its map gets a random name from datasets' own generator
-(a private `random.Random`, the same thing datasets does when a function cannot be hashed), so the
-global random state, the rows, the tokens and their order are unchanged. Every other map (TRL's
-own, anything with cache files, anything with an explicit name or cache file) is left as it is.
+Soup's text SFT helper (`soup_cli.trainer.sft._map_text_sft_rows`) builds
+`Dataset.from_list(rows)` and maps a closure over the chat formatter onto it. `datasets` names the
+result of every map by hashing the mapped function with dill, and this closure holds the tokenizer:
+the hash serializes its whole 151k-token vocabulary (about 760k Python objects), about 2 s of every
+`soup train` on a Kaggle T4, only to name a cache file that an in-memory dataset never writes.
+
+Here the same rows go through the same formatter, row by row, in our own loop, with Soup's own
+check and error message for rows without a loss target, and the dataset is built from the results
+in memory (`Dataset.from_list`, the way Soup builds its input). The columns, their order, their
+types and every value are the ones the map produces (checked by test_kernels.py). `datasets`'
+fingerprinting, its cache and the random state are not touched: the result gets the fingerprint
+`datasets` gives any in-memory dataset. Organizers' answer (Soup Tasters chat, 31.10, 14:13): own
+tokenization code, rows bit for bit the same, datasets kept in memory without a cache on disk,
+is allowed.
 """
-
-import contextvars
-import functools
-
-_IN_SOUP_TEXT_MAP = contextvars.ContextVar("soup_text_sft_map", default=False)
 
 
 def patch_soup_text_map():
-    import datasets
-    from datasets import fingerprint
     from soup_cli.trainer import sft
 
     helper = sft._map_text_sft_rows
     if getattr(helper, "_soup_patched", False):
         return
-    cls = datasets.Dataset
-    original_map = cls.map
 
-    @functools.wraps(original_map)
-    def map(self, *args, **kwargs):  # noqa: A001 - the name of Dataset.map
-        if _IN_SOUP_TEXT_MAP.get() and type(self) is cls and len(args) <= 1 and \
-                kwargs.get("new_fingerprint") is None and kwargs.get("cache_file_name") is None \
-                and kwargs.get("num_proc") in (None, 0, 1) and \
-                getattr(self, "cache_files", None) == []:
-            kwargs["new_fingerprint"] = fingerprint.generate_random_fingerprint()
-        return original_map(self, *args, **kwargs)
+    def map_text_sft_rows(rows, *, format_row, split, max_length):
+        from datasets import Dataset
+        from soup_cli.data.loss_mask import NoCausalLossTargetError, ensure_causal_loss_target
 
-    @functools.wraps(helper)
-    def map_text_sft_rows(*args, **kwargs):
-        token = _IN_SOUP_TEXT_MAP.set(True)
-        try:
-            return helper(*args, **kwargs)
-        finally:
-            _IN_SOUP_TEXT_MAP.reset(token)
+        source = Dataset.from_list(rows)
+        if "messages" not in source.column_names:  # what map would reject: Soup's own path
+            return helper(rows, format_row=format_row, split=split, max_length=max_length)
+        out = []
+        for index, example in enumerate(source):  # the python rows map hands its function
+            try:
+                formatted = format_row(example)
+                labels = formatted.get("labels")
+                if labels is not None:
+                    ensure_causal_loss_target(labels, max_length=max_length)
+            except NoCausalLossTargetError as exc:
+                raise ValueError(f"{split} row {index + 1}: {exc}") from exc
+            # map's row: the input columns but "messages", updated with the formatter's output
+            row = {key: value for key, value in example.items() if key != "messages"}
+            row.update(formatted)
+            out.append(row)
+        if not out:
+            return helper(rows, format_row=format_row, split=split, max_length=max_length)
+        return Dataset.from_list(out)
 
     map_text_sft_rows._soup_patched = True
-    cls.map = map
     sft._map_text_sft_rows = map_text_sft_rows

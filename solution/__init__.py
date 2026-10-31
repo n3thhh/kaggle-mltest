@@ -17,8 +17,11 @@ before Soup builds the model and the trainer.
 - `mlp.py`       in long batches the MLP keeps only its fp16 input and recomputes gate/up
 - `imports.py`   TRL reuses transformers' package-metadata scan instead of a second one
 - `optional_imports.py` scikit-learn and wandb (unused here) not imported by transformers / TRL
-- `dataset_name.py` Soup's tokenization map named at random instead of by hashing the tokenizer
+- `dataset_name.py` Soup's text rows tokenized by our own loop, not a `Dataset.map` that hashes
+                 the tokenizer to name a cache an in-memory dataset never writes
 - `offload.py`   4-bit weights and saved activations in pinned host memory, streamed per layer
+- `preload.py`   the model loaded in a thread while TRL and Soup import, handed to Soup if its
+                 call matches
 - `head_stream.py` the tied embedding / head in pinned host memory: loss over vocabulary chunks
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
 - `test_kernels.py`  every kernel against plain PyTorch (GPU): `python -m pytest solution -q`
@@ -56,10 +59,24 @@ def apply():
 
     _try("kernel warm-up", start)  # first: our kernels compile while everything else loads
     from .optional_imports import (import_candidate_generator_without_sklearn,
+                                   import_data_metrics_without_sklearn,
+                                   import_detection_losses_without_scipy,
                                    import_trl_base_trainer_without_wandb)
 
     _try("assisted-generation helpers without scikit-learn",
          import_candidate_generator_without_sklearn)  # before anything imports generation
+    _try("GLUE metric helpers without scikit-learn", import_data_metrics_without_sklearn)
+    _try("object-detection losses without SciPy", import_detection_losses_without_scipy)
+    from . import offload
+
+    if offload.ENABLED:  # before the model is loaded: weights go to host memory as quantized
+        _try("4-bit weights in pinned host memory", offload.patch_quantize)
+        _try("loading without GPU pre-allocation, embedding to host memory",
+             offload.patch_loading)
+    _try("checkpoint tensors converted to fp16 on the GPU", offload.patch_materialize)
+    from .preload import start as start_preload
+
+    _try("model loaded in a thread while libraries import", start_preload)
     from .imports import import_trl
 
     _try("one package-metadata scan", import_trl)  # before anything of ours imports TRL
@@ -67,7 +84,7 @@ def apply():
     _try("TRL's base trainer without wandb", import_trl_base_trainer_without_wandb)
     from .dataset_name import patch_soup_text_map
 
-    _try("Soup's tokenization map without hashing the tokenizer", patch_soup_text_map)
+    _try("Soup's text rows tokenized by our own loop", patch_soup_text_map)
     mark("apply(): Soup's trainer imported")
     from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
     from .nf4 import patch_bnb_matmul_4bit, patch_linear4bit
@@ -91,13 +108,6 @@ def apply():
 
     _try("fp16 tied embedding", patch_embedding)
     _try("tied embedding kept fp16 at load", patch_prepare_kbit)
-    from . import offload
-
-    if offload.ENABLED:  # before the model is loaded: weights go to host memory as quantized
-        _try("4-bit weights in pinned host memory", offload.patch_quantize)
-        _try("loading without GPU pre-allocation, embedding to host memory",
-             offload.patch_loading)
-    _try("checkpoint tensors converted to fp16 on the GPU", offload.patch_materialize)
     _try("timeline", _timeline)
     mark("apply() done")
 

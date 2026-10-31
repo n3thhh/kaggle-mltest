@@ -374,3 +374,35 @@ def test_streamed_head_matches_resident():
     torch.testing.assert_close(got[1], ref[1], rtol=1e-3, atol=1e-3)
     assert (got[2] != ref[2]).sum().item() <= 2
     torch.testing.assert_close(got[3], ref[3].float(), rtol=2e-2, atol=2e-2 * 4096)
+
+
+# --- dataset_name.py --------------------------------------------------------------------------
+
+def test_own_tokenization_loop_matches_soups_map():
+    import random
+
+    from soup_cli.trainer import sft
+
+    import solution.dataset_name as dataset_name
+
+    rows = [{"messages": [{"role": "user", "content": f"q{i}"},
+                          {"role": "assistant", "content": f"a{i}"}], "extra": i}
+            for i in range(300)]
+
+    def format_row(example):
+        n = 5 + len(example["messages"][0]["content"])
+        ids = [random.randrange(1000) for _ in range(n)]
+        return {"input_ids": ids, "attention_mask": [1] * n, "labels": [-100] * 3 + ids[3:]}
+
+    original = sft._map_text_sft_rows
+    random.seed(1)
+    ref = original(rows, format_row=format_row, split="train", max_length=512)
+    dataset_name.patch_soup_text_map()
+    try:
+        random.seed(1)
+        got = sft._map_text_sft_rows(rows, format_row=format_row, split="train", max_length=512)
+    finally:
+        sft._map_text_sft_rows = original
+    assert ref.data.schema == got.data.schema
+    assert ref.features == got.features
+    assert ref.to_list() == got.to_list()
