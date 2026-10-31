@@ -135,6 +135,7 @@ def _timeline():
             return train(self, *args, **kwargs)
         finally:
             mark("trainer: train() done")
+            _release_activation_memory()
             _print_step_clock()
             try:
                 from .layer import MEMORY
@@ -190,3 +191,29 @@ def _print_step_clock():
           f"{avg('step_begin', 'loss_begin'):.1f}, forward+loss {avg('loss_begin', 'loss_end'):.1f},"
           f" backward+optimizer {avg('loss_end', 'step_end'):.1f}, end->next begin "
           f"{avg('step_end', 'next_begin'):.1f}", file=sys.stderr)
+
+
+def _release_activation_memory():
+    """After the last step the pinned host memory of the saved activations (about 2 GB) is no
+    longer used: release it on a thread of its own while Soup saves the adapter, instead of at
+    process exit. Not a daemon thread: the process waits for it before exiting."""
+    def release():
+        try:
+            import torch
+
+            from . import offload
+
+            for store in offload._ACTS.values():
+                with store.lock:
+                    store.blocks = []
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        import threading
+
+        threading.Thread(target=release, name="soup-release-host-memory").start()
+    except Exception:  # noqa: BLE001
+        pass

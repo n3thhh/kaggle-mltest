@@ -131,6 +131,16 @@ class HeadStream:
     def close(self):
         self.slots = None
 
+    def prefetch_start(self):
+        """Start copying the first two chunks now (during the last decoder layer), so the head
+        does not begin by waiting for them."""
+        if not self.cuda or len(self.chunks) < 2:
+            return
+        self.open()
+        for slot, j in zip(self.slots, (0, 1)):
+            if slot["idx"] != j:
+                self._load(slot, j)
+
     def _load(self, slot, j):
         c0, c1 = self.chunks[j]
         free = torch.cuda.Event()

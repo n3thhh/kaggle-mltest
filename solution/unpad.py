@@ -222,6 +222,20 @@ def _segments(attention_mask, config):
     return segments
 
 
+def _prefetch_head(model):
+    """The head streamed from host memory (head_stream.py): its first chunks start crossing PCIe
+    while the last decoder layer computes (from the second step on, once checked)."""
+    try:
+        from . import head_stream as hs
+
+        weight = model.embed_tokens.weight
+        host = hs.host_of(weight)
+        if host is not None and hs.VERIFIED["done"] and weight.is_cuda:
+            hs.head_stream(host, weight.device).prefetch_start()
+    except Exception:  # noqa: BLE001 - only a prefetch
+        pass
+
+
 def patch_qwen2_model():
     from transformers.modeling_outputs import BaseModelOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2 as mq
@@ -323,6 +337,8 @@ def patch_qwen2_model():
                                                           offloaded=store is not None)
                 fused.sample_memory("decoder start", rows.device)
                 for i, layer in enumerate(layers):
+                    if i == len(layers) - 1:
+                        _prefetch_head(self)
                     hidden = fused.run_layer(layer, hidden, ctx, cos2, sin2, i < recompute,
                                              index=i, weights=weights, store=store,
                                              last=i == len(layers) - 1)
