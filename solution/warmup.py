@@ -76,17 +76,17 @@ def _compile_all():
         lambda: layer.gate_up_act_bwd_kernel[(1, 1)](
             t(I, f16), t(2 * I, f16), t(2 * I, f16), I, BLOCK=layer.ACT_BLOCK),
         # the int8 MLP GEMMs (layer.py): weights, activations, epilogues, and cuBLASLt's int8 GEMM
-        lambda: layer.nf4_int8_rows_kernel[(1,)](
+        lambda: None if not layer.INT8_FORWARD else layer.nf4_int8_rows_kernel[(1,)](
             t(H // 2, u8), t(H // 64, f32), t(H // 2, u8), t(H // 64, f32), t(16, f32),
             t(H, i8), t(1, f32), I, H, QBLOCK=64, BLOCK=2048),
         lambda: layer.nf4_int8_t_kernel[(1, 1)](
             t(64 * H // 2, u8), t(64 * H // 64, f32), t(64 * H // 2, u8), t(64 * H // 64, f32),
             t(16, f32), t(128, f32), t(128 * 1024, i8), 1024, 1024, H, QBLOCK=64, BN=64, BK=128),
-        lambda: layer.row_quant_kernel[(1,)](t(H, f16), t(H, i8), t(1, f32), H, BLOCK=2048,
-                                             num_warps=4),
+        lambda: None if not layer.INT8_FORWARD else layer.row_quant_kernel[(1,)](
+            t(H, f16), t(H, i8), t(1, f32), H, BLOCK=2048, num_warps=4),
         lambda: layer.row_quant_kernel[(1,)](t(H, f32), t(H, i8), t(1, f32), H, BLOCK=2048,
                                              num_warps=4),
-        lambda: layer.gate_up_act_fwd_i8_kernel[(1, 1)](
+        lambda: None if not layer.INT8_FORWARD else layer.gate_up_act_fwd_i8_kernel[(1, 1)](
             t(2 * I, i32), t(1, f32), t(2 * I, f32), t(2 * I, f16), t(I, f16), I,
             BLOCK=layer.ACT_BLOCK),
         lambda: layer.gate_up_act_bwd_i8_kernel[(1,)](

@@ -518,8 +518,9 @@ def _sources(layers, streamed, device):
 # (measured with torch._int_mm: 2.6 ms instead of 3.9 ms for gate|up at 1,536 tokens). The
 # organizers allow int8 GEMMs on weights made from the NF4 weights, forward and for input
 # gradients. Measured on the real model (W8A8, per-row scales): int8 in every projection moves the
-# loss by +3.1 % (the first step allows 1 %), int8 in gate|up only by +0.3 %. So:
-#   forward   gate|up (60 % of the layer's GEMM work) in int8; q|k|v, o and down stay fp16
+# loss by +3.1 % (the first step allows 1 %), int8 in gate|up only by +0.3 % on average, but by
+# 0.87 % on the first step of a Kaggle run. So:
+#   forward   every GEMM stays fp16 (INT8_FORWARD turns int8 gate|up on: kernels kept and tested)
 #   backward  the input gradients of down and of gate|up (90 % of the backward GEMM work) in int8;
 #             they do not enter the loss, only the gradients that reach LoRA
 # Weights: int8 made from the NF4 bytes on the GPU at each use (as the fp16 ones are), one scale
@@ -527,6 +528,9 @@ def _sources(layers, streamed, device):
 # input-gradient GEMM. Activations and gradients: one scale per token. A self-check at the first
 # step compares the layer with fp32 and turns int8 off if it is off by more than allowed.
 INT8 = True
+# The forward int8 GEMM is off: on the Kaggle T4 it moved the first step's loss by 0.87 % (the
+# check allows 1 %, and the jury's rows differ). The backward int8 GEMMs do not touch the loss.
+INT8_FORWARD = False
 INT8_CHUNK = 512  # tokens per int8 GEMM: bounds its int32 output (36 MB for gate|up)
 _COLSCALE = {}
 
@@ -893,6 +897,7 @@ class FusedDecoderLayer(torch.autograd.Function):
                           float(layer.post_attention_layernorm.variance_epsilon), dtype)
         if spec.int8:
             _col_scales(mlp, dtype, w_gu, w_d)  # once per layer and run, for the backward pass
+        if spec.int8 and INT8_FORWARD:
             x8, sx = _row_quant(y2)
             del y2
             w8, sw = _int8_rows((mlp.gate_proj, mlp.up_proj), w_gu)
