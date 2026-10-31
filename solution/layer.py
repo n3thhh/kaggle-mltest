@@ -62,10 +62,13 @@ def nf4_dequant_multi_kernel(p0, a0, p1, a1, p2, a2, code_ptr, out_ptr, nb0, nb1
         packed = p2
         absmax = a2
         local = pid - nb0 - nb1
-    offs = local.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    byte = tl.load(packed + offs // 2).to(tl.int32)
-    nibble = (byte >> ((1 - (offs % 2)).to(tl.int32) * 4)) & 0xF
-    value = tl.load(code_ptr + nibble) * tl.load(absmax + offs // QBLOCK)
+    # one load per byte (two weights), the two codes interleaved high nibble first, and one
+    # absmax per QBLOCK weights broadcast over its block
+    byte = tl.load(packed + local.to(tl.int64) * (BLOCK // 2) + tl.arange(0, BLOCK // 2))
+    byte = byte.to(tl.int32)
+    value = tl.interleave(tl.load(code_ptr + ((byte >> 4) & 0xF)), tl.load(code_ptr + (byte & 0xF)))
+    scale = tl.load(absmax + local.to(tl.int64) * (BLOCK // QBLOCK) + tl.arange(0, BLOCK // QBLOCK))
+    value = tl.reshape(tl.reshape(value, (BLOCK // QBLOCK, QBLOCK)) * scale[:, None], (BLOCK,))
     tl.store(out_ptr + pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK),
              value.to(out_ptr.dtype.element_ty))
 
