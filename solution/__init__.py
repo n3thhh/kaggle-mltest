@@ -62,10 +62,12 @@ def apply():
     from .imports import import_trl
 
     _try("one package-metadata scan", import_trl)  # before anything of ours imports TRL
+    mark("apply(): TRL imported")
     _try("TRL's base trainer without wandb", import_trl_base_trainer_without_wandb)
     from .dataset_name import patch_soup_text_map
 
     _try("Soup's tokenization map without hashing the tokenizer", patch_soup_text_map)
+    mark("apply(): Soup's trainer imported")
     from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
     from .nf4 import patch_bnb_matmul_4bit, patch_linear4bit
     from .rmsnorm import patch_qwen2_rmsnorm
@@ -83,6 +85,7 @@ def apply():
     _try("padding-free decoder", patch_qwen2_model)
     _try("padding-free attention", patch_qwen2_attention)
     _try("LoRA dropout with the base masks", patch_dropout)
+    mark("apply(): model patches in place")
     from .embed import patch_embedding, patch_prepare_kbit
 
     _try("fp16 tied embedding", patch_embedding)

@@ -70,12 +70,33 @@ def nf4_dequant_multi_kernel(p0, a0, p1, a1, p2, a2, code_ptr, out_ptr, nb0, nb1
              value.to(out_ptr.dtype.element_ty))
 
 
-@triton.jit(do_not_specialize=["has_d", "write_y"])
-def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y_ptr, y16_ptr, rstd_ptr, n_cols, eps, has_d,
-                           write_y, BLOCK: tl.constexpr):
-    """h = x (+ d), then RMSNorm: y = w * h / rms(h) in fp32 (written if WRITE_Y), its copy in
-    the GEMM dtype, and 1/rms. d is the fp16 output of o_proj (h = the residual stream after
-    attention, summed in fp32 as the base run does)."""
+@triton.jit
+def _pack_bits(keep, BLOCK: tl.constexpr):
+    """[BLOCK] 0/1 int32 -> [BLOCK // 8] bytes, bit k of byte j = element 8 j + k."""
+    bits = tl.reshape(keep, (BLOCK // 8, 8))
+    return tl.sum(bits * (1 << tl.arange(0, 8))[None, :], axis=1)
+
+
+@triton.jit
+def _unpack_bits(ptr, n_bytes, BLOCK: tl.constexpr):
+    """The [BLOCK] 0/1 float32 mask from BLOCK // 8 bytes at ptr (n_bytes of them valid)."""
+    idx = tl.arange(0, BLOCK // 8)
+    packed = tl.load(ptr + idx, mask=idx < n_bytes, other=0).to(tl.int32)
+    bits = (packed[:, None] >> tl.arange(0, 8)[None, :]) & 1
+    return tl.reshape(bits, (BLOCK,)).to(tl.float32)
+
+
+@triton.jit(do_not_specialize=["has_d", "drop_mode"])
+def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y16_ptr, rstd_ptr, keepq_ptr, keepv_ptr, rows_ptr,
+                           packed_ptr, oq_ptr, ov_ptr, n_cols, eps, scale_q, scale_v, has_d,
+                           drop_mode, BLOCK: tl.constexpr):
+    """h = x (+ d), then RMSNorm: y = w * h / rms(h) in fp32, its copy in the GEMM dtype, and
+    1/rms. d is the fp16 output of o_proj (h = the residual stream after attention, summed in
+    fp32 as the base run does). drop_mode 1 or 2: also LoRA's two dropout outputs for q and v
+    from the fp32 y, y * mask * 1/(1-p), rounded once to the GEMM dtype (what the base run's
+    dropout on the norm's output gives). Mode 1 reads the token's row of the masks drawn over the
+    padded batch and also writes them packed 8 per byte (the backward pass reads those);
+    mode 2 reads the packed masks."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -84,20 +105,38 @@ def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y_ptr, y16_ptr, rstd_ptr, n_cols
         h += tl.load(d_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = 1.0 / tl.sqrt(tl.sum(h * h, axis=0) / n_cols + eps)
     y = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32) * (h * rstd)
-    if write_y != 0:
-        tl.store(y_ptr + row * n_cols + cols, y, mask=mask)
     tl.store(y16_ptr + row * n_cols + cols, y.to(y16_ptr.dtype.element_ty), mask=mask)
     tl.store(rstd_ptr + row, rstd)
+    if drop_mode != 0:
+        n_bytes = n_cols // 8
+        packed_row = packed_ptr + row * 2 * n_bytes
+        if drop_mode == 1:
+            src = tl.load(rows_ptr + row).to(tl.int64)
+            iq = tl.load(keepq_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.int32)
+            iv = tl.load(keepv_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.int32)
+            idx = tl.arange(0, BLOCK // 8)
+            tl.store(packed_row + idx, _pack_bits(iq, BLOCK).to(tl.uint8), mask=idx < n_bytes)
+            tl.store(packed_row + n_bytes + idx, _pack_bits(iv, BLOCK).to(tl.uint8),
+                     mask=idx < n_bytes)
+            kq = iq.to(tl.float32)
+            kv = iv.to(tl.float32)
+        else:
+            kq = _unpack_bits(packed_row, n_bytes, BLOCK)
+            kv = _unpack_bits(packed_row + n_bytes, n_bytes, BLOCK)
+        tl.store(oq_ptr + row * n_cols + cols, (y * kq * scale_q).to(oq_ptr.dtype.element_ty),
+                 mask=mask)
+        tl.store(ov_ptr + row * n_cols + cols, (y * kv * scale_v).to(ov_ptr.dtype.element_ty),
+                 mask=mask)
 
 
 @triton.jit(do_not_specialize=["has_lora", "has_dy", "has_d"])
-def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, keepq_ptr, keepv_ptr, rows_ptr, x_ptr, d_ptr,
-                            w_ptr, rstd_ptr, dres_ptr, dx_ptr, n_cols, scale_q, scale_v, has_dy,
-                            has_lora, has_d, BLOCK: tl.constexpr):
+def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, packed_ptr, x_ptr, d_ptr, w_ptr, rstd_ptr,
+                            dres_ptr, dx_ptr, n_cols, scale_q, scale_v, has_dy, has_lora, has_d,
+                            BLOCK: tl.constexpr):
     """dx of RMSNorm for one row, plus the residual's gradient. The gradient reaching the norm's
     output is the base GEMMs' (fp16) plus, before attention, LoRA's two dropout branches
-    (fp16 gradient * the row's padded-batch dropout mask * 1/(1-p)), summed in fp32. The norm's
-    input is x (+ d), recomputed instead of stored."""
+    (fp16 gradient * the token's dropout mask, packed 8 per byte, * 1/(1-p)), summed in fp32.
+    The norm's input is x (+ d), recomputed instead of stored."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -105,9 +144,9 @@ def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, keepq_ptr, keepv_ptr, rows_p
     if has_dy != 0:
         g += tl.load(dy_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     if has_lora != 0:
-        src = tl.load(rows_ptr + row).to(tl.int64)
-        kq = tl.load(keepq_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.float32)
-        kv = tl.load(keepv_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.float32)
+        n_bytes = n_cols // 8
+        kq = _unpack_bits(packed_ptr + row * 2 * n_bytes, n_bytes, BLOCK)
+        kv = _unpack_bits(packed_ptr + row * 2 * n_bytes + n_bytes, n_bytes, BLOCK)
         g += tl.load(dq_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32) * kq * scale_q
         g += tl.load(dv_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32) * kv * scale_v
     h = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
@@ -120,22 +159,6 @@ def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, keepq_ptr, keepv_ptr, rows_p
     dx = rstd * (gw - h_hat * proj)
     dx += tl.load(dres_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     tl.store(dx_ptr + row * n_cols + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def lora_dropout_pair_kernel(y_ptr, keepq_ptr, keepv_ptr, rows_ptr, oq_ptr, ov_ptr, n_cols,
-                             scale_q, scale_v, BLOCK: tl.constexpr):
-    """LoRA's dropout for q and v on the real tokens: y * mask * 1/(1-p) in fp32 with each
-    token's row of the masks drawn over the padded batch, rounded once to the GEMM dtype."""
-    row = tl.program_id(0).to(tl.int64)
-    src = tl.load(rows_ptr + row).to(tl.int64)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < n_cols
-    y = tl.load(y_ptr + row * n_cols + cols, mask=mask, other=0.0)
-    kq = tl.load(keepq_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.float32)
-    kv = tl.load(keepv_ptr + src * n_cols + cols, mask=mask, other=0).to(tl.float32)
-    tl.store(oq_ptr + row * n_cols + cols, (y * kq * scale_q).to(oq_ptr.dtype.element_ty), mask=mask)
-    tl.store(ov_ptr + row * n_cols + cols, (y * kv * scale_v).to(ov_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -373,6 +396,12 @@ def _rng_set(device, state):
         torch.set_rng_state(state)
 
 
+def _probe(x):
+    """A [1, hidden] fp32 tensor: the dropout masks depend only on the padded batch's shape and
+    on the dtype of the norm's output (fp32), as in the base run."""
+    return _dummy(torch.float32, x.device).expand(1, x.shape[1])
+
+
 def _masks(u, y, p_q, p_v):
     """The two dropout masks the base run draws, in its order (q's LoRA first, then v's)."""
     return unpad._padded_dropout_keep(u, y, p_q), unpad._padded_dropout_keep(u, y, p_v)
@@ -390,31 +419,52 @@ def _dummy(dtype, device):
     return _DUMMIES[key]
 
 
-def _norm(x, d, weight, eps, dtype, want_y):
+def _norm(x, d, weight, eps, dtype, drop=None):
+    """(y16, 1/rms) of RMSNorm(x (+ d)), and with drop also LoRA's dropout outputs:
+    drop = (keep_q, keep_v, rows, scale_q, scale_v) -> (y16, 1/rms, drop_q, drop_v, packed masks);
+    drop = (packed masks, scale_q, scale_v) -> (y16, 1/rms, drop_q, drop_v)."""
     n, cols = x.shape
-    y = torch.empty((n, cols), dtype=torch.float32, device=x.device) if want_y else None
     y16 = torch.empty((n, cols), dtype=dtype, device=x.device)
     rstd = torch.empty(n, dtype=torch.float32, device=x.device)
-    add_rmsnorm_fwd_kernel[(n,)](x, d if d is not None else _dummy(dtype, x.device), weight,
-                                 y if want_y else _dummy(torch.float32, x.device), y16, rstd,
-                                 cols, eps, int(d is not None), int(want_y),
-                                 BLOCK=triton.next_power_of_2(cols),
+    half = _dummy(dtype, x.device)
+    flags = _dummy(torch.bool, x.device)
+    rows = _dummy(torch.int64, x.device)
+    keep_q = keep_v = flags
+    packed = _dummy(torch.uint8, x.device)
+    oq = ov = half
+    scale_q = scale_v = 1.0
+    mode = 0
+    if drop is not None and len(drop) == 5:
+        keep_q, keep_v, rows, scale_q, scale_v = drop
+        packed = torch.empty((n, 2 * (cols // 8)), dtype=torch.uint8, device=x.device)
+        mode = 1
+    elif drop is not None:
+        packed, scale_q, scale_v = drop
+        mode = 2
+    if mode:
+        oq, ov = torch.empty_like(y16), torch.empty_like(y16)
+    add_rmsnorm_fwd_kernel[(n,)](x, d if d is not None else half, weight, y16, rstd, keep_q,
+                                 keep_v, rows, packed, oq, ov, cols, eps, scale_q, scale_v,
+                                 int(d is not None), mode, BLOCK=triton.next_power_of_2(cols),
                                  num_warps=8 if cols >= 4096 else 4)
-    return y, y16, rstd
+    if mode == 1:
+        return y16, rstd, oq, ov, packed
+    if mode == 2:
+        return y16, rstd, oq, ov
+    return y16, rstd
 
 
-def _norm_bwd(dy, dq, dv, keep_q, keep_v, rows, x, d, weight, rstd, dres, scale_q, scale_v):
+def _norm_bwd(dy, dq, dv, packed, x, d, weight, rstd, dres, scale_q, scale_v):
     n, cols = x.shape
     dx = torch.empty_like(x, dtype=torch.float32)
     lora = dq is not None
     half = dy.dtype if dy is not None else (dq.dtype if lora else torch.float16)
     f16 = _dummy(half, x.device)
-    flags = _dummy(torch.bool, x.device)
     rmsnorm_bwd_lora_kernel[(n,)](
         dy if dy is not None else f16, dq if lora else f16, dv if lora else f16,
-        keep_q if lora else flags, keep_v if lora else flags, rows, x,
-        d if d is not None else f16, weight, rstd, dres, dx, cols, scale_q, scale_v,
-        int(dy is not None), int(lora), int(d is not None), BLOCK=triton.next_power_of_2(cols),
+        packed if lora else _dummy(torch.uint8, x.device), x, d if d is not None else f16,
+        weight, rstd, dres, dx, cols, scale_q, scale_v, int(dy is not None), int(lora),
+        int(d is not None), BLOCK=triton.next_power_of_2(cols),
         num_warps=8 if cols >= 4096 else 4)
     return dx
 
@@ -552,16 +602,11 @@ class FusedDecoderLayer(torch.autograd.Function):
         w_qkv, w_o, w_gu, w_d = (ws[0:3], ws[3:4], ws[4:6], ws[6:7]) if ws else (None,) * 4
 
         # attention block
-        y, y16, rstd1 = _norm(x, None, layer.input_layernorm.weight,
-                              float(layer.input_layernorm.variance_epsilon), dtype, True)
-        rng = _rng_get(x.device)
-        keep_q, keep_v = _masks(u, y, p_q, p_v)
-        drop_q = torch.empty((n, hidden), dtype=dtype, device=x.device)
-        drop_v = torch.empty_like(drop_q)
-        lora_dropout_pair_kernel[(n, triton.cdiv(hidden, ROW_BLOCK))](
-            y, keep_q, keep_v, u.rows, drop_q, drop_v, hidden, 1.0 / (1.0 - p_q),
-            1.0 / (1.0 - p_v), BLOCK=ROW_BLOCK)
-        del y, keep_q, keep_v
+        keep_q, keep_v = _masks(u, _probe(x), p_q, p_v)
+        y16, rstd1, drop_q, drop_v, packed = _norm(
+            x, None, layer.input_layernorm.weight, float(layer.input_layernorm.variance_epsilon),
+            dtype, (keep_q, keep_v, u.rows, 1.0 / (1.0 - p_q), 1.0 / (1.0 - p_v)))
+        del keep_q, keep_v
         base = (qp.base_layer, kp, vp.base_layer)
         w = _dequant(base, dtype, w_qkv)
         qkv = torch.addmm(_bias(base, dtype), y16, w.t())
@@ -583,12 +628,12 @@ class FusedDecoderLayer(torch.autograd.Function):
         # What the backward pass needs goes to host memory as soon as it exists, so the copies
         # run while the rest of the layer computes and the GPU copies are released early.
         offload = spec.store is not None and not spec.last  # the last layer's are needed first
-        handle = spec.store.save([x, out]) if offload else None
+        handle = spec.store.save([x, out, packed]) if offload else None
         o16 = torch.mm(out.reshape(n, heads * dim), _dequant((op,), dtype, w_o).t())
 
         # MLP block
-        _, y2, rstd2 = _norm(x, o16, layer.post_attention_layernorm.weight,
-                             float(layer.post_attention_layernorm.variance_epsilon), dtype, False)
+        y2, rstd2 = _norm(x, o16, layer.post_attention_layernorm.weight,
+                          float(layer.post_attention_layernorm.variance_epsilon), dtype)
         gu = torch.mm(y2, _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu).t())
         del y2
         inter = gu.shape[1] // 2
@@ -609,7 +654,7 @@ class FusedDecoderLayer(torch.autograd.Function):
         h2 = x + o16  # the residual stream after attention, in fp32 as in the base run
         h2 += d16
 
-        ctx.spec, ctx.rng = spec, rng
+        ctx.spec = spec
         ctx.consts = (p_q, p_v, s_q, s_v, heads, kv_heads, dim, inter)
         ctx.aux = aux
         # Kept for the backward pass: x (fp32) and attention's output; q, k, v and o16 are
@@ -620,16 +665,16 @@ class FusedDecoderLayer(torch.autograd.Function):
         ctx.handle = handle
         if offload:
             spec.u.handles[spec.index] = handle
-            big = [rstd2, rstd2]  # placeholders: the tensors travel to host memory
+            big = [rstd2, rstd2, rstd2]  # placeholders: the tensors travel to host memory
         else:
-            big = [x, out]
+            big = [x, out, packed]
         big.append(gu if gu is not None else rstd2)
         ctx.save_for_backward(*big, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w)
         return h2
 
     @staticmethod
     def backward(ctx, dh2):
-        (x, out, gu, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
+        (x, out, packed, gu, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
         spec, u, dtype = ctx.spec, ctx.spec.u, ctx.spec.dtype
         if spec.store is not None:
             if ctx.handle is not None:
@@ -638,9 +683,9 @@ class FusedDecoderLayer(torch.autograd.Function):
                 spec.store.prefetch(u.handles.get(spec.index - 1))
             if ctx.handle is not None:
                 loaded = spec.store.load(ctx.handle)
-                x, out = loaded[0], loaded[1]
+                x, out, packed = loaded[0], loaded[1], loaded[2]
                 if ctx.gu_host:
-                    gu = loaded[2]
+                    gu = loaded[3]
                 del loaded
                 ctx.handle = None
         recompute = spec.recompute_mlp and not ctx.gu_host
@@ -661,7 +706,7 @@ class FusedDecoderLayer(torch.autograd.Function):
         # MLP block
         w_gu_full = None
         if recompute:
-            _, y2, _ = _norm(x, o16, norm2.weight, float(norm2.variance_epsilon), dtype, False)
+            y2, _ = _norm(x, o16, norm2.weight, float(norm2.variance_epsilon), dtype)
             w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
             gu = torch.mm(y2, w_gu_full.t())
             del y2
@@ -686,23 +731,14 @@ class FusedDecoderLayer(torch.autograd.Function):
             del w_half
         sample_memory("layer backward", x.device)
         del d_gu, w_gu_full
-        dh1 = _norm_bwd(dy2, None, None, None, None, u.rows, x, o16, norm2.weight, rstd2, dh2,
+        dh1 = _norm_bwd(dy2, None, None, None, x, o16, norm2.weight, rstd2, dh2,
                         1.0, 1.0)
         del dy2, o16
 
         # q, k, v again: the norm, the dropout masks (redrawn from the saved RNG state), the
         # q|k|v GEMM, the LoRA outputs from the saved A outputs, the rotary embedding
-        y, y16, _ = _norm(x, None, norm1.weight, float(norm1.variance_epsilon), dtype, True)
-        now = _rng_get(x.device)
-        _rng_set(x.device, ctx.rng)
-        keep_q, keep_v = _masks(u, y, p_q, p_v)
-        _rng_set(x.device, now)
-        drop_q = torch.empty((n, hidden), dtype=dtype, device=x.device)
-        drop_v = torch.empty_like(drop_q)
-        lora_dropout_pair_kernel[(n, triton.cdiv(hidden, ROW_BLOCK))](
-            y, keep_q, keep_v, u.rows, drop_q, drop_v, hidden, 1.0 / (1.0 - p_q),
-            1.0 / (1.0 - p_v), BLOCK=ROW_BLOCK)
-        del y
+        y16, _, drop_q, drop_v = _norm(x, None, norm1.weight, float(norm1.variance_epsilon),
+                                       dtype, (packed, 1.0 / (1.0 - p_q), 1.0 / (1.0 - p_v)))
         base = (qp.base_layer, kp, vp.base_layer)
         w_attn = _dequant(base, dtype, w_qkv)
         qkv = torch.addmm(_bias(base, dtype), y16, w_attn.t())
@@ -748,7 +784,7 @@ class FusedDecoderLayer(torch.autograd.Function):
             dd_q = torch.mm(da_q, aq16)
             dd_v = torch.mm(da_v, av16)
             dy = torch.mm(d_qkv, w_attn)
-            dx = _norm_bwd(dy, dd_q, dd_v, keep_q, keep_v, u.rows, x, None, norm1.weight, rstd1,
+            dx = _norm_bwd(dy, dd_q, dd_v, packed, x, None, norm1.weight, rstd1,
                            dh1, 1.0 / (1.0 - p_q), 1.0 / (1.0 - p_v))
         return dx, grad_aq, grad_bq, grad_av, grad_bv, None
 
@@ -762,7 +798,7 @@ class FusedDecoderLayer(torch.autograd.Function):
 # recompute nothing.
 ACT_BUDGET_MB = 1300.0
 OFFLOAD_ACT_BUDGET_MB = 0.0
-KEPT_BYTES_PER_TOKEN_LAYER = 9 * 1024 + 128
+KEPT_BYTES_PER_TOKEN_LAYER = 4 * 1536 + 2 * 1536 + 2 * 1536 // 8  # x fp32, out fp16, masks
 # gate|up goes to host memory in every layer (measured on the T4: 6 % faster steps than
 # recomputing it in one layer out of three, at the same memory peak). N > 1: recomputed in one
 # layer out of N; 0: always recomputed.
@@ -775,12 +811,12 @@ def mlp_to_host(index):
     return MLP_HOST_PERIOD == 1 or index % MLP_HOST_PERIOD != MLP_HOST_PERIOD - 1
 
 
-def host_bytes(n_tokens, n_layers, inter):
+def host_bytes(n_tokens, n_layers, inter, hidden=1536):
     """Pinned host memory the saved tensors of one step take (every layer but the last: x and
     attention's output; gate|up where mlp_to_host), with the 512-byte alignment of each."""
     total = 2**20
     for index in range(n_layers - 1):
-        total += KEPT_BYTES_PER_TOKEN_LAYER * n_tokens + 3 * 512
+        total += (4 * hidden + 2 * hidden + 2 * (hidden // 8)) * n_tokens + 4 * 512
         if mlp_to_host(index):
             total += 4 * inter * n_tokens
     return total
@@ -851,6 +887,7 @@ def eligible(layer):
         return False
     if getattr(mlp.config, "hidden_act", "silu") != "silu" or attn.attention_dropout or \
             attn.config._attn_implementation != "sdpa" or attn.head_dim % 2 or \
+            attn.config.hidden_size % 8 or \
             layer.input_layernorm.weight.requires_grad or \
             layer.post_attention_layernorm.weight.requires_grad:
         return False
@@ -1067,7 +1104,8 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
                 _Attention.mode = mode
                 sub.handles = {}
                 if keep_host:
-                    store.begin_step(host_bytes(m, 2, layer.mlp.config.intermediate_size))
+                    store.begin_step(host_bytes(m, 2, layer.mlp.config.intermediate_size,
+                                                xin.shape[1]))
                 torch.cuda.set_rng_state(state, device)
                 out = run_layer(layer, xin, sub, cos, sin, True, index=0,
                                 weights=weights if stream else None,

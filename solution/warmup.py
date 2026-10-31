@@ -54,15 +54,13 @@ def _compile_all():
             t(1024, torch.uint8), t(32, f32), t(16, f32), t(2048, f16), 1152, 192, QBLOCK=64,
             BLOCK=layer.DEQUANT_BLOCK),
         lambda: layer.add_rmsnorm_fwd_kernel[(2,)](
-            t(2 * H, f32), t(2 * H, f16), t(H, f32), t(2 * H, f32), t(2 * H, f16), t(2, f32), H,
-            1e-6, 1, 1, BLOCK=2048, num_warps=4),
+            t(2 * H, f32), t(2 * H, f16), t(H, f32), t(2 * H, f16), t(2, f32), keep, keep, rows,
+            t(2 * H // 4, torch.uint8), t(2 * H, f16), t(2 * H, f16), H, 1e-6, 1.0, 1.0, 1, 1,
+            BLOCK=2048, num_warps=4),
         lambda: layer.rmsnorm_bwd_lora_kernel[(2,)](
-            t(2 * H, f16), t(2 * H, f16), t(2 * H, f16), keep, keep, rows, t(2 * H, f32),
-            t(2 * H, f16), t(H, f32), t(2, f32), t(2 * H, f32), t(2 * H, f32), H, 1.0, 1.0, 1, 1,
-            1, BLOCK=2048, num_warps=4),
-        lambda: layer.lora_dropout_pair_kernel[(2, 2)](
-            t(2 * H, f32), keep, keep, rows, t(2 * H, f16), t(2 * H, f16), H, 1.0, 1.0,
-            BLOCK=layer.ROW_BLOCK),
+            t(2 * H, f16), t(2 * H, f16), t(2 * H, f16), t(2 * H // 4, torch.uint8),
+            t(2 * H, f32), t(2 * H, f16), t(H, f32), t(2, f32), t(2 * H, f32), t(2 * H, f32), H,
+            1.0, 1.0, 1, 1, 1, BLOCK=2048, num_warps=4),
         lambda: layer.qkv_lora_rope_kernel[(1, HEADS)](
             t(QKV, f16), t(HEADS * HEAD_DIM, f16), t(KV * HEAD_DIM, f16), t(HEAD_DIM, f32),
             t(HEAD_DIM, f32), t(HEADS * HEAD_DIM, f16), t(HEADS * HEAD_DIM, f16),
