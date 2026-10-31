@@ -10,9 +10,9 @@ once the 4-bit weights live in host memory (offload.py). Here it lives in pinned
   by `ce_chunk_stats_kernel`, which then, for the labelled tokens, overwrites the logits with
   exp(logit - running max), the target's column zeroed; that times the chunk is added to an fp32
   accumulator rescaled by exp(old max - new max) (online softmax, as flash attention does for its
-  output). `target_rows_kernel` picks each token's target row of the weight. At the end,
-  `ce_finalize_kernel` gives log-sum-exp, entropy, cross-entropy and accuracy, and
-  `ce_grad_finalize_kernel` the gradient sum_{j != t} p_j w_j - (1 - p_t) w_t. Keeping the target
+  output), and each token's target row of the weight is picked from the chunk that has it. At
+  the end, `ce_finalize_kernel` gives log-sum-exp, entropy, cross-entropy and accuracy, and the
+  gradient is sum_{j != t} p_j w_j - (1 - p_t) w_t. Keeping the target
   out of the accumulated sum avoids the cancellation of sum_j p_j w_j - w_t when p_t is near 1.
 
 The weight crosses PCIe once per step (0.47 GB) on a copy engine while the GEMMs run.
@@ -26,10 +26,10 @@ CHUNK = 8192
 STAT_BLOCK = 2048
 
 
-@triton.jit(do_not_specialize=["n_cols", "col0", "n_grad"])
+@triton.jit(do_not_specialize=["n_cols", "col0", "n_grad", "first"])
 def ce_chunk_stats_kernel(logits_ptr, stride_row, n_cols, col0, target_ptr, m_ptr, s_ptr, d_ptr,
-                          best_ptr, bidx_ptr, tlogit_ptr, alpha_ptr, n_grad,
-                          MAX_COLS: tl.constexpr, BLOCK_V: tl.constexpr, FIRST: tl.constexpr,
+                          best_ptr, bidx_ptr, tlogit_ptr, alpha_ptr, n_grad, first,
+                          MAX_COLS: tl.constexpr, BLOCK_V: tl.constexpr,
                           WRITE_E: tl.constexpr):
     """Fold one vocabulary chunk's logits of one token into its running statistics. With
     WRITE_E, for the first n_grad (labelled) tokens, the logits are then overwritten with
@@ -38,18 +38,17 @@ def ce_chunk_stats_kernel(logits_ptr, stride_row, n_cols, col0, target_ptr, m_pt
     row = tl.program_id(0).to(tl.int64)
     row_ptr = logits_ptr + row * stride_row
     target = tl.load(target_ptr + row)
-    if FIRST:
-        run_max = tl.full([], float("-inf"), tl.float32)
-        run_sum = tl.full([], 0.0, tl.float32)
-        run_dot = tl.full([], 0.0, tl.float32)
-        best = tl.full([], float("-inf"), tl.float32)
-        best_idx = tl.full([], 0, tl.int64)
-    else:
-        run_max = tl.load(m_ptr + row)
-        run_sum = tl.load(s_ptr + row)
-        run_dot = tl.load(d_ptr + row)
-        best = tl.load(best_ptr + row)
-        best_idx = tl.load(bidx_ptr + row)
+    run_max = tl.load(m_ptr + row)
+    run_sum = tl.load(s_ptr + row)
+    run_dot = tl.load(d_ptr + row)
+    best = tl.load(best_ptr + row)
+    best_idx = tl.load(bidx_ptr + row)
+    is_first = first != 0  # the first chunk: the buffers hold nothing yet
+    run_max = tl.where(is_first, float("-inf"), run_max)
+    run_sum = tl.where(is_first, 0.0, run_sum)
+    run_dot = tl.where(is_first, 0.0, run_dot)
+    best = tl.where(is_first, float("-inf"), best)
+    best_idx = tl.where(is_first, 0, best_idx).to(tl.int64)
     old_max = run_max
     for start in range(0, MAX_COLS, BLOCK_V):  # the last chunk is shorter: masked
         cols = start + tl.arange(0, BLOCK_V)
@@ -84,51 +83,6 @@ def ce_chunk_stats_kernel(logits_ptr, stride_row, n_cols, col0, target_ptr, m_pt
                 x = tl.load(row_ptr + cols, mask=in_row, other=float("-inf")).to(tl.float32)
                 e = tl.where(col0 + cols == target, 0.0, tl.exp(x - run_max))
                 tl.store(row_ptr + cols, e.to(logits_ptr.dtype.element_ty), mask=in_row)
-
-
-@triton.jit(do_not_specialize=["n_cols", "col0"])
-def target_rows_kernel(w_ptr, n_cols, col0, target_ptr, out_ptr, HIDDEN: tl.constexpr,
-                       BLOCK_H: tl.constexpr):
-    """out[row] = w[target - col0] for the tokens whose target is in this vocabulary chunk."""
-    row = tl.program_id(0).to(tl.int64)
-    target = tl.load(target_ptr + row)
-    if (target >= col0) & (target < col0 + n_cols):
-        src = w_ptr + (target - col0) * HIDDEN
-        for start in range(0, HIDDEN, BLOCK_H):
-            cols = start + tl.arange(0, BLOCK_H)
-            mask = cols < HIDDEN
-            tl.store(out_ptr + row * HIDDEN + cols, tl.load(src + cols, mask=mask), mask=mask)
-
-
-@triton.jit(do_not_specialize=["n_rows"])
-def ce_grad_finalize_kernel(acc_ptr, wt_ptr, s_ptr, lse_ptr, tlogit_ptr, n_rows, grad_scale,
-                            HIDDEN: tl.constexpr, BLOCK_H: tl.constexpr):
-    """grad = grad_scale * (sum_{j != t} p_j w_j - (1 - p_t) w_t), from the accumulated
-    sum_{j != t} exp(l_j - max) w_j (acc), the softmax denominator and the target's row."""
-    row = tl.program_id(0).to(tl.int64)
-    inv_s = 1.0 / tl.load(s_ptr + row)
-    p_t = tl.exp(tl.load(tlogit_ptr + row) - tl.load(lse_ptr + row))
-    for start in range(0, HIDDEN, BLOCK_H):
-        cols = start + tl.arange(0, BLOCK_H)
-        mask = cols < HIDDEN
-        acc = tl.load(acc_ptr + row * HIDDEN + cols, mask=mask, other=0.0)
-        wt = tl.load(wt_ptr + row * HIDDEN + cols, mask=mask, other=0.0).to(tl.float32)
-        tl.store(acc_ptr + row * HIDDEN + cols,
-                 (acc * inv_s - (1.0 - p_t) * wt) * grad_scale, mask=mask)
-
-
-@triton.jit
-def rescale_add_kernel(acc_ptr, part_ptr, alpha_ptr, HIDDEN: tl.constexpr,
-                       BLOCK_H: tl.constexpr):
-    """acc[row] = acc[row] * alpha[row] + part[row] (fp32 accumulator, fp16 chunk product)."""
-    row = tl.program_id(0).to(tl.int64)
-    alpha = tl.load(alpha_ptr + row)
-    for start in range(0, HIDDEN, BLOCK_H):
-        cols = start + tl.arange(0, BLOCK_H)
-        mask = cols < HIDDEN
-        acc = tl.load(acc_ptr + row * HIDDEN + cols, mask=mask, other=0.0)
-        part = tl.load(part_ptr + row * HIDDEN + cols, mask=mask, other=0.0).to(tl.float32)
-        tl.store(acc_ptr + row * HIDDEN + cols, acc * alpha + part, mask=mask)
 
 
 @triton.jit(do_not_specialize=["n_rows"])
@@ -234,6 +188,7 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
     if n == 0:
         return entropy, token_loss, correct, grad
     if k > 0:
+        t_k = targets[:k]
         alpha = torch.empty(k, dtype=f32, device=device)
         wt = torch.zeros((k, hidden_size), dtype=hidden.dtype, device=device)
         part16 = torch.empty((k, hidden_size), dtype=hidden.dtype, device=device)
@@ -243,30 +198,30 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
     width = max(c1 - c0 for c0, c1 in stream.chunks)
     width = triton.cdiv(width, STAT_BLOCK) * STAT_BLOCK
     logits = torch.empty((n, width), dtype=hidden.dtype, device=device)
-    block_h = triton.next_power_of_2(hidden_size)
     for j in range(count):
         c0, c1 = stream.chunks[j]
         w = stream.get(j, j + 1 if j + 1 < count else None)
         part = logits[:, : c1 - c0]
         torch.mm(hidden, w.t(), out=part)
         ce_chunk_stats_kernel[(n,)](part, part.stride(0), c1 - c0, c0, targets, m, s, d, best,
-                                    bidx, tlogit, alpha, k, MAX_COLS=logits.shape[1],
-                                    BLOCK_V=STAT_BLOCK, FIRST=j == 0, WRITE_E=k > 0,
-                                    num_warps=8)
+                                    bidx, tlogit, alpha, k, int(j == 0),
+                                    MAX_COLS=logits.shape[1], BLOCK_V=STAT_BLOCK,
+                                    WRITE_E=k > 0, num_warps=8)
         if k > 0:
             torch.mm(part[:k], w, out=part16)
-            rescale_add_kernel[(k,)](grad, part16, alpha, HIDDEN=hidden_size, BLOCK_H=block_h)
-            target_rows_kernel[(k,)](w, c1 - c0, c0, targets, wt, HIDDEN=hidden_size,
-                                     BLOCK_H=block_h)
+            grad.mul_(alpha[:, None]).add_(part16)  # rescaled to the new running max
+            here = (t_k >= c0) & (t_k < c1)  # the targets' rows of the weight, from this chunk
+            rows = w.index_select(0, (t_k - c0).clamp_(0, c1 - c0 - 1))
+            wt.copy_(torch.where(here[:, None], rows, wt))
     from .layer import sample_memory
 
     sample_memory("head", device)
     stream.close()
     ce_finalize_kernel[(triton.cdiv(n, 1024),)](targets, m, s, d, bidx, tlogit, entropy,
                                                 token_loss, correct, lse, n, BLOCK=1024)
-    if k > 0:
-        ce_grad_finalize_kernel[(k,)](grad, wt, s, lse, tlogit, k, grad_scale,
-                                      HIDDEN=hidden_size, BLOCK_H=block_h)
+    if k > 0:  # sum_{j != t} p_j w_j - (1 - p_t) w_t, scaled
+        p_t = torch.exp(tlogit[:k] - lse[:k])
+        grad.div_(s[:k, None]).sub_((1.0 - p_t)[:, None] * wt.float()).mul_(grad_scale)
     return entropy, token_loss, correct, grad
 
 

@@ -70,9 +70,9 @@ def nf4_dequant_multi_kernel(p0, a0, p1, a1, p2, a2, code_ptr, out_ptr, nb0, nb1
              value.to(out_ptr.dtype.element_ty))
 
 
-@triton.jit
-def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y_ptr, y16_ptr, rstd_ptr, n_cols, eps,
-                           BLOCK: tl.constexpr, HAS_D: tl.constexpr, WRITE_Y: tl.constexpr):
+@triton.jit(do_not_specialize=["has_d", "write_y"])
+def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y_ptr, y16_ptr, rstd_ptr, n_cols, eps, has_d,
+                           write_y, BLOCK: tl.constexpr):
     """h = x (+ d), then RMSNorm: y = w * h / rms(h) in fp32 (written if WRITE_Y), its copy in
     the GEMM dtype, and 1/rms. d is the fp16 output of o_proj (h = the residual stream after
     attention, summed in fp32 as the base run does)."""
@@ -80,20 +80,20 @@ def add_rmsnorm_fwd_kernel(x_ptr, d_ptr, w_ptr, y_ptr, y16_ptr, rstd_ptr, n_cols
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
     h = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
-    if HAS_D:
+    if has_d != 0:
         h += tl.load(d_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = 1.0 / tl.sqrt(tl.sum(h * h, axis=0) / n_cols + eps)
     y = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32) * (h * rstd)
-    if WRITE_Y:
+    if write_y != 0:
         tl.store(y_ptr + row * n_cols + cols, y, mask=mask)
     tl.store(y16_ptr + row * n_cols + cols, y.to(y16_ptr.dtype.element_ty), mask=mask)
     tl.store(rstd_ptr + row, rstd)
 
 
-@triton.jit(do_not_specialize=["has_lora", "has_dy"])
+@triton.jit(do_not_specialize=["has_lora", "has_dy", "has_d"])
 def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, keepq_ptr, keepv_ptr, rows_ptr, x_ptr, d_ptr,
                             w_ptr, rstd_ptr, dres_ptr, dx_ptr, n_cols, scale_q, scale_v, has_dy,
-                            has_lora, BLOCK: tl.constexpr, HAS_D: tl.constexpr):
+                            has_lora, has_d, BLOCK: tl.constexpr):
     """dx of RMSNorm for one row, plus the residual's gradient. The gradient reaching the norm's
     output is the base GEMMs' (fp16) plus, before attention, LoRA's two dropout branches
     (fp16 gradient * the row's padded-batch dropout mask * 1/(1-p)), summed in fp32. The norm's
@@ -111,7 +111,7 @@ def rmsnorm_bwd_lora_kernel(dy_ptr, dq_ptr, dv_ptr, keepq_ptr, keepv_ptr, rows_p
         g += tl.load(dq_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32) * kq * scale_q
         g += tl.load(dv_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32) * kv * scale_v
     h = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
-    if HAS_D:
+    if has_d != 0:
         h += tl.load(d_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = tl.load(rstd_ptr + row)
     h_hat = h * rstd
@@ -378,14 +378,27 @@ def _masks(u, y, p_q, p_v):
     return unpad._padded_dropout_keep(u, y, p_q), unpad._padded_dropout_keep(u, y, p_v)
 
 
+_DUMMIES = {}
+
+
+def _dummy(dtype, device):
+    """A one-element tensor for a pointer argument a kernel does not read (one compiled variant
+    of the kernel serves every call)."""
+    key = (dtype, device)
+    if key not in _DUMMIES:
+        _DUMMIES[key] = torch.zeros(1, dtype=dtype, device=device)
+    return _DUMMIES[key]
+
+
 def _norm(x, d, weight, eps, dtype, want_y):
     n, cols = x.shape
     y = torch.empty((n, cols), dtype=torch.float32, device=x.device) if want_y else None
     y16 = torch.empty((n, cols), dtype=dtype, device=x.device)
     rstd = torch.empty(n, dtype=torch.float32, device=x.device)
-    add_rmsnorm_fwd_kernel[(n,)](x, d if d is not None else x, weight, y if want_y else y16, y16,
-                                 rstd, cols, eps, BLOCK=triton.next_power_of_2(cols),
-                                 HAS_D=d is not None, WRITE_Y=want_y,
+    add_rmsnorm_fwd_kernel[(n,)](x, d if d is not None else _dummy(dtype, x.device), weight,
+                                 y if want_y else _dummy(torch.float32, x.device), y16, rstd,
+                                 cols, eps, int(d is not None), int(want_y),
+                                 BLOCK=triton.next_power_of_2(cols),
                                  num_warps=8 if cols >= 4096 else 4)
     return y, y16, rstd
 
@@ -394,12 +407,14 @@ def _norm_bwd(dy, dq, dv, keep_q, keep_v, rows, x, d, weight, rstd, dres, scale_
     n, cols = x.shape
     dx = torch.empty_like(x, dtype=torch.float32)
     lora = dq is not None
-    dummy = dres
+    half = dy.dtype if dy is not None else (dq.dtype if lora else torch.float16)
+    f16 = _dummy(half, x.device)
+    flags = _dummy(torch.bool, x.device)
     rmsnorm_bwd_lora_kernel[(n,)](
-        dy if dy is not None else dummy, dq if lora else dummy, dv if lora else dummy,
-        keep_q if lora else rows, keep_v if lora else rows, rows, x,
-        d if d is not None else x, weight, rstd, dres, dx, cols, scale_q, scale_v,
-        int(dy is not None), int(lora), BLOCK=triton.next_power_of_2(cols), HAS_D=d is not None,
+        dy if dy is not None else f16, dq if lora else f16, dv if lora else f16,
+        keep_q if lora else flags, keep_v if lora else flags, rows, x,
+        d if d is not None else f16, weight, rstd, dres, dx, cols, scale_q, scale_v,
+        int(dy is not None), int(lora), int(d is not None), BLOCK=triton.next_power_of_2(cols),
         num_warps=8 if cols >= 4096 else 4)
     return dx
 

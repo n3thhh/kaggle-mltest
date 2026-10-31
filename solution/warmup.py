@@ -59,19 +59,12 @@ def _compile_all(offline=False, part=0, parts=1):
             t(1024, torch.uint8), t(32, f32), t(16, f32), t(2048, f16), 1152, 192, QBLOCK=64,
             BLOCK=layer.DEQUANT_BLOCK),
         lambda: layer.add_rmsnorm_fwd_kernel[(2,)](
-            t(2 * H, f32), t(2 * H, f32), t(H, f32), t(2 * H, f32), t(2 * H, f16), t(2, f32), H,
-            1e-6, BLOCK=2048, HAS_D=False, WRITE_Y=True, num_warps=4),
-        lambda: layer.add_rmsnorm_fwd_kernel[(2,)](
-            t(2 * H, f32), t(2 * H, f16), t(H, f32), t(2 * H, f16), t(2 * H, f16), t(2, f32), H,
-            1e-6, BLOCK=2048, HAS_D=True, WRITE_Y=False, num_warps=4),
-        lambda: layer.rmsnorm_bwd_lora_kernel[(2,)](
-            t(2 * H, f16), t(2 * H, f32), t(2 * H, f32), rows, rows, rows, t(2 * H, f32),
-            t(2 * H, f16), t(H, f32), t(2, f32), t(2 * H, f32), t(2 * H, f32), H, 1.0, 1.0, 1, 0,
-            BLOCK=2048, HAS_D=True, num_warps=4),
+            t(2 * H, f32), t(2 * H, f16), t(H, f32), t(2 * H, f32), t(2 * H, f16), t(2, f32), H,
+            1e-6, 1, 1, BLOCK=2048, num_warps=4),
         lambda: layer.rmsnorm_bwd_lora_kernel[(2,)](
             t(2 * H, f16), t(2 * H, f16), t(2 * H, f16), keep, keep, rows, t(2 * H, f32),
-            t(2 * H, f32), t(H, f32), t(2, f32), t(2 * H, f32), t(2 * H, f32), H, 1.0, 1.0, 1, 1,
-            BLOCK=2048, HAS_D=False, num_warps=4),
+            t(2 * H, f16), t(H, f32), t(2, f32), t(2 * H, f32), t(2 * H, f32), H, 1.0, 1.0, 1, 1,
+            1, BLOCK=2048, num_warps=4),
         lambda: layer.lora_dropout_pair_kernel[(2, 2)](
             t(2 * H, f32), keep, keep, rows, t(2 * H, f16), t(2 * H, f16), H, 1.0, 1.0,
             BLOCK=layer.ROW_BLOCK),
@@ -103,24 +96,12 @@ def _compile_all(offline=False, part=0, parts=1):
         # the head streamed from host memory (head_stream.py)
         lambda: head_stream.ce_chunk_stats_kernel[(1,)](
             t(head_stream.CHUNK, f16), head_stream.CHUNK, head_stream.CHUNK, 0, t(1, i64),
-            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32), 1,
-            MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, FIRST=True, WRITE_E=True,
+            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32), 1, 1,
+            MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, WRITE_E=True,
             num_warps=8),
-        lambda: head_stream.ce_chunk_stats_kernel[(1,)](
-            t(head_stream.CHUNK, f16), head_stream.CHUNK, head_stream.CHUNK, 0, t(1, i64),
-            t(1, f32), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32), 1,
-            MAX_COLS=head_stream.CHUNK, BLOCK_V=head_stream.STAT_BLOCK, FIRST=False,
-            WRITE_E=True, num_warps=8),
         lambda: head_stream.ce_finalize_kernel[(1,)](
             t(1, i64), t(1, f32), t(1, f32), t(1, f32), t(1, i64), t(1, f32), t(1, f32),
             t(1, f32), t(1, torch.int32), t(1, f32), 1, BLOCK=1024),
-        lambda: head_stream.rescale_add_kernel[(1,)](
-            t(H, f32), t(H, f16), t(1, f32), HIDDEN=H, BLOCK_H=2048),
-        lambda: head_stream.target_rows_kernel[(1,)](
-            t(H, f16), 1, 0, t(1, i64), t(H, f16), HIDDEN=H, BLOCK_H=2048),
-        lambda: head_stream.ce_grad_finalize_kernel[(1,)](
-            t(H, f32), t(H, f16), t(1, f32), t(1, f32), t(1, f32), 1, 4096.0, HIDDEN=H,
-            BLOCK_H=2048),
     ]
     def host_memory():
         # pinned host memory for saved activations, sized for the longest batch (4 x 512)
