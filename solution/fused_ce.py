@@ -359,6 +359,9 @@ def patch_sft_trainer():
         inputs["use_cache"] = False
         capture = SimpleNamespace(step=None)
         _LOCAL.capture = capture
+        from . import clock
+
+        clock("loss_begin")
         try:
             loss, outputs = transformers.Trainer.compute_loss(
                 self, model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
@@ -378,6 +381,7 @@ def patch_sft_trainer():
             step = _step_from_logits(outputs.logits, inputs["labels"])
         setattr(self, STEP_ATTR, step)
         _log_trl_metrics(self, "train", inputs, step)
+        clock("loss_end")
         return (loss, outputs) if return_outputs else loss
 
     compute_loss._soup_patched = True

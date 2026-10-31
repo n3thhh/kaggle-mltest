@@ -93,6 +93,7 @@ def apply():
         _try("4-bit weights in pinned host memory", offload.patch_quantize)
         _try("loading without GPU pre-allocation, embedding to host memory",
              offload.patch_loading)
+    _try("checkpoint tensors converted to fp16 on the GPU", offload.patch_materialize)
     _try("timeline", _timeline)
     mark("apply() done")
 
@@ -110,6 +111,10 @@ def _timeline():
     def traced_init(self, *args, **kwargs):
         mark("trainer: init starts")
         init(self, *args, **kwargs)
+        try:
+            self.add_callback(_step_clock())
+        except Exception:  # noqa: BLE001
+            pass
         mark("trainer: init done")
 
     def traced_train(self, *args, **kwargs):
@@ -127,6 +132,7 @@ def _timeline():
             return train(self, *args, **kwargs)
         finally:
             mark("trainer: train() done")
+            _print_step_clock()
             try:
                 from .layer import MEMORY
                 from .unpad import _MAX_TOKENS
@@ -139,3 +145,45 @@ def _timeline():
                 pass
 
     trainer_cls.__init__, trainer_cls.train = traced_init, traced_train
+
+
+# --- where the wall time of a training step goes (CPU clock only: no synchronisation added) -----
+
+CLOCK = {"marks": [], "last": None}
+
+
+def clock(what):
+    CLOCK["last"] = CLOCK["last"] or {}
+    CLOCK["last"][what] = time.perf_counter()
+
+
+def _step_clock():
+    import transformers
+
+    class StepClock(transformers.TrainerCallback):
+        def on_step_begin(self, args, state, control, **kwargs):
+            now = time.perf_counter()
+            if CLOCK["last"] is not None and "step_end" in CLOCK["last"]:
+                CLOCK["last"]["next_begin"] = now
+                CLOCK["marks"].append(CLOCK["last"])
+            CLOCK["last"] = {"step_begin": now}
+
+        def on_step_end(self, args, state, control, **kwargs):
+            clock("step_end")
+
+    return StepClock()
+
+
+def _print_step_clock():
+    marks = [m for m in CLOCK["marks"][1:] if all(
+        k in m for k in ("step_begin", "loss_begin", "loss_end", "step_end", "next_begin"))]
+    if not marks:
+        return
+
+    def avg(a, b):
+        return 1000 * sum(m[b] - m[a] for m in marks) / len(marks)
+
+    print(f"[solution] step clock over {len(marks)} steps (ms): begin->forward "
+          f"{avg('step_begin', 'loss_begin'):.1f}, forward+loss {avg('loss_begin', 'loss_end'):.1f},"
+          f" backward+optimizer {avg('loss_end', 'step_end'):.1f}, end->next begin "
+          f"{avg('step_end', 'next_begin'):.1f}", file=sys.stderr)

@@ -101,6 +101,9 @@ def patch_quantize():
     original = cls._quantize
 
     def _quantize(self, device):
+        import time
+
+        began = time.perf_counter()
         result = original(self, device)
         try:
             data = self.data
@@ -126,10 +129,46 @@ def patch_quantize():
             import sys
 
             print(f"[solution] weight offload skipped: {exc!r}", file=sys.stderr)
+        LOAD_TIMES["quantize"] += time.perf_counter() - began
         return result
 
     _quantize._soup_patched = True
     cls._quantize = _quantize
+
+
+LOAD_TIMES = {"read and convert": 0.0, "quantize": 0.0}
+
+
+def patch_materialize():
+    """transformers' loader reads each checkpoint tensor (bf16 for Qwen2.5) and calls
+    `tensor.to(device="cuda", dtype=float16)`. For a blocking CPU -> GPU copy PyTorch converts the
+    dtype on the CPU first; here the bf16 bytes are copied to the GPU as they are and converted
+    there (the same IEEE round-to-nearest conversion, so the same fp16 values)."""
+    import time
+
+    import transformers.core_model_loading as loading
+
+    original = loading._materialize_copy
+    if getattr(original, "_soup_patched", False):
+        return
+
+    def _materialize_copy(tensor, device=None, dtype=None):
+        began = time.perf_counter()
+        try:
+            if device is not None and dtype is not None:
+                target = torch.device(device)
+                if target.type == "cuda":
+                    loaded = tensor[...]
+                    if loaded.device.type == "cpu" and loaded.dtype != dtype and \
+                            loaded.dtype.is_floating_point and dtype.is_floating_point:
+                        return loaded.to(device=target).to(dtype=dtype)
+                    return loaded.to(device=target, dtype=dtype)
+            return original(tensor, device, dtype)
+        finally:
+            LOAD_TIMES["read and convert"] += time.perf_counter() - began
+
+    _materialize_copy._soup_patched = True
+    loading._materialize_copy = _materialize_copy
 
 
 def patch_loading():
@@ -175,7 +214,8 @@ def patch_loading():
         try:
             return _from_pretrained(klass, *args, **kwargs)
         finally:
-            mark(f"from_pretrained({klass.__name__}) done")
+            mark(f"from_pretrained({klass.__name__}) done (of it: " + ", ".join(
+                f"{k} {v:.2f} s" for k, v in LOAD_TIMES.items()) + ")")
 
     def _from_pretrained(klass, *args, **kwargs):
         if not active["on"]:
