@@ -227,11 +227,25 @@ def rows_through_streamed_head(hidden, stream, targets, with_grad, n_grad, grad_
 
 # --- the embedding side ------------------------------------------------------------------------
 
+_RESERVED = {}
+
+
+def reserve(shape, dtype):
+    """Pinned host memory for the embedding, allocated ahead (by the warm-up thread)."""
+    _RESERVED[(tuple(shape), dtype)] = torch.empty(shape, dtype=dtype, pin_memory=True)
+
+
+def take_reserved(shape, dtype):
+    return _RESERVED.pop((shape, dtype), None)
+
+
 def offload_tied_embedding(embedding, device):
     """Keep the (fp16, tied) embedding weight in pinned host memory, leaving a zero-stride
     placeholder of its shape on `device`."""
     weight = embedding.weight
-    host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
+    host = take_reserved(tuple(weight.shape), weight.dtype)
+    if host is None:
+        host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
     host.copy_(weight.data)
     weight._soup_host = host
     weight.data = torch.zeros(1, dtype=weight.dtype, device=device).as_strided(

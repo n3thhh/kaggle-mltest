@@ -311,8 +311,10 @@ def patch_qwen2_model():
                     store = None
                 ctx.handles, ctx.mlp_calls = {}, 0
                 if store is not None:
+                    # (plus room for one gate|up lost at a block boundary)
                     store.begin_step(fused.host_bytes(n_real, len(layers),
-                                                      cfg.intermediate_size))
+                                                      cfg.intermediate_size) +
+                                     4 * cfg.intermediate_size * n_real)
                 recompute = fused.mlp_layers_to_recompute(n_real, len(layers),
                                                           cfg.intermediate_size,
                                                           offloaded=store is not None)

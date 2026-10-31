@@ -59,6 +59,9 @@ def _resident(packed, quant_state):
     """The packed bytes on the GPU: the weight itself, or its copy from pinned host memory when
     offload.py keeps it there (the parameter then holds a zero-stride placeholder)."""
     if getattr(quant_state, "_soup_host", None) is not None:
+        from .offload import host_ready
+
+        host_ready()
         return quant_state._soup_host.to(packed.device, non_blocking=True)
     return packed
 

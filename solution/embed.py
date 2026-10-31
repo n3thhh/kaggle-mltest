@@ -65,6 +65,15 @@ def patch_prepare_kbit():
         return
 
     def prepare_model_for_kbit_training(model, *args, **kwargs):
+        from . import mark
+
+        mark("prepare_model_for_kbit_training starts")
+        try:
+            return _prepare(model, *args, **kwargs)
+        finally:
+            mark("prepare_model_for_kbit_training done")
+
+    def _prepare(model, *args, **kwargs):
         try:
             embedding = model.get_input_embeddings()
             head = model.get_output_embeddings()

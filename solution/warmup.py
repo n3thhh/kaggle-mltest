@@ -99,15 +99,20 @@ def _compile_all():
             t(1, f32), t(1, torch.int32), t(1, f32), 1, BLOCK=1024),
     ]
     def host_memory():
-        # pinned host memory for saved activations, sized for the longest batch (4 x 512)
-        from . import offload
-
+        # Pinned host memory, allocated here while the main thread imports libraries: the
+        # blocks for the 4-bit weights (about 0.75 GB, filled during loading), the tied
+        # embedding (467 MB) and the saved activations of a 1,536-token step (grown at a step
+        # that needs more).
+        if not offload.ENABLED:
+            return
+        offload.WEIGHTS.reserve(3)
+        if offload.HEAD:
+            head_stream.reserve((VOCAB, HIDDEN), torch.float16)
         store = offload.activation_store(dev)
-        if store is not None and store.arena is None:
-            store.arena = torch.empty(layer.host_bytes(2048, 28, INTER), dtype=torch.uint8,
-                                      pin_memory=True)
+        if store is not None:
+            store.reserve(layer.host_bytes(1536, 28, INTER) + 4 * INTER * 1536)
 
-    jobs.append(host_memory)
+    jobs.insert(0, host_memory)
     import time
 
     TIMES["start"] = time.perf_counter()

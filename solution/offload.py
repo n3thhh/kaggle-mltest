@@ -32,8 +32,16 @@ class HostArena:
 
     def __init__(self, block_bytes):
         self.block_bytes = block_bytes
-        self.blocks, self.used = [], 0
+        self.blocks, self.used, self.spare = [], 0, []
         self.lock = threading.Lock()
+
+    def reserve(self, n_blocks):
+        """Allocate `n_blocks` blocks ahead of use (pinning memory takes time: the warm-up thread
+        does it while the main thread is still importing libraries)."""
+        for _ in range(n_blocks):
+            block = torch.empty(self.block_bytes, dtype=torch.uint8, pin_memory=True)
+            with self.lock:
+                self.spare.append(block)
 
     def alloc(self, numel, dtype=torch.uint8):
         """`numel` elements of `dtype`, 512-byte aligned."""
@@ -41,8 +49,11 @@ class HostArena:
         nbytes = (numel * itemsize + 511) // 512 * 512
         with self.lock:
             if not self.blocks or self.used + nbytes > self.blocks[-1].numel():
-                self.blocks.append(torch.empty(max(self.block_bytes, nbytes), dtype=torch.uint8,
-                                               pin_memory=True))
+                if self.spare and self.spare[0].numel() >= nbytes:
+                    self.blocks.append(self.spare.pop(0))
+                else:
+                    self.blocks.append(torch.empty(max(self.block_bytes, nbytes),
+                                                   dtype=torch.uint8, pin_memory=True))
                 self.used = 0
             view = self.blocks[-1][self.used:self.used + nbytes]
             self.used += nbytes
@@ -58,12 +69,25 @@ def _placeholder(like):
         like.shape, (0,) * like.dim())
 
 
+_COPIES_DONE = [False]
+
+
+def host_ready():
+    """Once, before the host copies of the weights are first read: wait for the copies queued
+    during loading (they may have been queued on another stream than the one reading)."""
+    if not _COPIES_DONE[0]:
+        _COPIES_DONE[0] = True
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+
 def is_offloaded(quant_state):
     return getattr(quant_state, "_soup_host", None) is not None
 
 
 def fetch(quant_state, device):
     """The packed weight on the GPU (synchronous use outside the fused layers)."""
+    host_ready()
     return quant_state._soup_host.to(device, non_blocking=True)
 
 
@@ -88,10 +112,14 @@ def patch_quantize():
                 from .nf4 import _absmax_fp32
 
                 absmax, _ = _absmax_fp32(qs)
+                # Copies queued on the current stream, without waiting for them: everything
+                # that later reads these host copies is queued after them on the GPU (the
+                # weight stream waits for this stream), and the freed GPU memory is reused in
+                # stream order.
                 host = WEIGHTS.alloc(data.numel())
-                host.copy_(data.reshape(-1))
+                host.copy_(data.reshape(-1), non_blocking=True)
                 host_absmax = WEIGHTS.alloc(absmax.numel(), torch.float32)
-                host_absmax.copy_(absmax)
+                host_absmax.copy_(absmax, non_blocking=True)
                 qs._soup_host, qs._soup_host_absmax = host, host_absmax
                 qs._soup_absmax_fp32 = None  # the GPU copy is released; nf4.py refetches
                 self.data = _placeholder(data)
@@ -224,18 +252,42 @@ class ActivationStore:
         self.device = device
         self.d2h = torch.cuda.Stream(device)
         self.h2d = torch.cuda.Stream(device)
-        self.arena = None
+        self.blocks, self.block, self.offset = [], 0, 0
+        self.lock = threading.Lock()
         self.pending = {}
         self.in_flight = []
 
+    def capacity(self):
+        return sum(block.numel() for block in self.blocks)
+
+    def reserve(self, nbytes):
+        """Grow the pinned blocks to at least `nbytes` (blocks are kept from step to step)."""
+        with self.lock:
+            missing = nbytes - self.capacity()
+            if missing > 0:
+                self.blocks.append(torch.empty(missing, dtype=torch.uint8, pin_memory=True))
+
     def begin_step(self, nbytes):
-        if self.arena is None or self.arena.numel() < nbytes:
-            self.arena = torch.empty(max(nbytes, 512 * 2**20), dtype=torch.uint8,
-                                     pin_memory=True)
-        self.used = 0
+        self.reserve(nbytes)
+        self.block, self.offset = 0, 0
         self.in_flight = []
         # the previous step's last host-to-device reads must finish before this step writes
         self.d2h.wait_stream(self.h2d)
+
+    def _take(self, nbytes):
+        """The next `nbytes` of pinned memory (512-byte aligned) in the blocks, in order."""
+        while True:
+            if self.block < len(self.blocks):
+                block = self.blocks[self.block]
+                start = (self.offset + 511) // 512 * 512
+                if start + nbytes <= block.numel():
+                    self.offset = start + nbytes
+                    return block[start:start + nbytes]
+                self.block, self.offset = self.block + 1, 0
+            else:  # more than reserved (should not happen): one more block
+                with self.lock:
+                    self.blocks.append(torch.empty(max(nbytes, 256 * 2**20), dtype=torch.uint8,
+                                                   pin_memory=True))
 
     def save(self, tensors, handle=None):
         """Start copying `tensors` (GPU) to host; returns a handle (or adds them to `handle`)."""
@@ -247,9 +299,7 @@ class ActivationStore:
         with torch.cuda.stream(self.d2h):
             for t in tensors:
                 nbytes = t.numel() * t.element_size()
-                start = (self.used + 511) // 512 * 512
-                self.used = start + nbytes
-                host = self.arena[start:start + nbytes].view(t.dtype).view(t.shape)
+                host = self._take(nbytes).view(t.dtype).view(t.shape)
                 host.copy_(t, non_blocking=True)
                 t.record_stream(self.d2h)  # the allocator keeps t until the copy is done
                 hosts.append(host)
@@ -295,6 +345,7 @@ _STATE = {}
 
 def weight_stream(model_layers, device):
     """The model's WeightStream (built at first use), or None when the weights are on the GPU."""
+    host_ready()
     first = model_layers[0] if len(model_layers) else None
     key = (id(first), len(model_layers))
     hit = _STATE.get(key)
@@ -326,6 +377,7 @@ def layer_quant_states(layer):
 def restore_weights(root):
     """Every offloaded 4-bit weight under `root` back on the GPU (the per-module path's
     fallback when the fused layer is not used: weights fetched per use would be slow)."""
+    host_ready()
     for module in root.modules():
         weight = getattr(module, "weight", None)
         qs = getattr(weight, "quant_state", None)

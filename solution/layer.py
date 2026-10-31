@@ -763,10 +763,10 @@ class FusedDecoderLayer(torch.autograd.Function):
 ACT_BUDGET_MB = 1300.0
 OFFLOAD_ACT_BUDGET_MB = 0.0
 KEPT_BYTES_PER_TOKEN_LAYER = 9 * 1024 + 128
-# gate|up goes to host memory in two layers out of three and is recomputed in the third: that
-# keeps the copy engines (12 GB/s each way on the T4's PCIe) about as busy as the GEMMs, so
-# neither waits for the other. 0: always recompute, 1: always to host.
-MLP_HOST_PERIOD = int(__import__("os").environ.get("SOUP_SOLUTION_MLP_HOST_PERIOD", "3"))
+# gate|up goes to host memory in every layer (measured on the T4: 6 % faster steps than
+# recomputing it in one layer out of three, at the same memory peak). N > 1: recomputed in one
+# layer out of N; 0: always recomputed.
+MLP_HOST_PERIOD = int(__import__("os").environ.get("SOUP_SOLUTION_MLP_HOST_PERIOD", "1"))
 
 
 def mlp_to_host(index):
@@ -947,6 +947,9 @@ def _reference_fp32(layer, x, u, cos, sin, keep_q, keep_v):
         import bitsandbytes.functional as bnb_f
 
         qs = module.weight.quant_state
+        from .offload import host_ready
+
+        host_ready()
         packed = qs._soup_host.to(x.device) if getattr(qs, "_soup_host", None) is not None \
             else module.weight.data
         return bnb_f.dequantize_4bit(packed.reshape(-1, 1), quant_state=qs).to(torch.float16)
