@@ -4,7 +4,7 @@ Qwen2.5-1.5B's tied embedding is 151,936 x 1,536 fp16 = 467 MB, the largest thin
 once the 4-bit weights live in host memory (offload.py). Here it lives in pinned host memory too:
 
 * the input embedding gathers the batch's rows on the CPU and sends those (a few MB);
-* the head streams the weight through two GPU slots of 8,192 vocabulary rows, on a copy stream,
+* the head streams the weight through two GPU slots of 4,096 vocabulary rows, on a copy stream,
   one chunk ahead of compute, in one pass. Each chunk: every token times the chunk, folded into
   running per-token statistics (max, sum of exp, sum of exp * logit, argmax, the target's logit)
   by `ce_chunk_stats_kernel`, which then, for the labelled tokens, overwrites the logits with
@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-CHUNK = 8192
+CHUNK = 4096  # vocabulary rows per chunk: 12.6 MB per GPU slot
 STAT_BLOCK = 2048
 
 

@@ -298,6 +298,7 @@ def patch_qwen2_model():
         hidden = inputs_embeds.reshape(batch * seq, -1).index_select(0, rows).unsqueeze(0)
         position_embeddings = (cos[0].index_select(0, token_pos).unsqueeze(0),
                                sin[0].index_select(0, token_pos).unsqueeze(0))
+        del inputs_embeds, cos, sin  # the padded [B, T, hidden] copy is not needed any more
         _LOCAL.ctx = ctx
         try:
             if all_fused:
@@ -326,7 +327,7 @@ def patch_qwen2_model():
                     weights = None
                 if not fused.STATE["store"]:
                     store = None
-                ctx.handles, ctx.mlp_calls = {}, 0
+                ctx.handles, ctx.handles_gu, ctx.mlp_calls = {}, {}, 0
                 if store is not None:
                     # (plus room for one gate|up lost at a block boundary)
                     store.begin_step(fused.host_bytes(n_real, len(layers),

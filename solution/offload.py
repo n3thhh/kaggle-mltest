@@ -344,12 +344,13 @@ class ActivationStore:
                 hosts.append(host)
         done = torch.cuda.Event()
         done.record(self.d2h)
-        # At most two batches of copies in flight (about one layer's): the GPU memory of a
-        # tensor being copied is held until its copy ends, so a backlog would raise the memory
-        # peak. Waiting here (CPU side) costs nothing while the copies keep pace.
-        self.in_flight.append(done)
-        while len(self.in_flight) > 2:
+        # One batch of copies in flight: before this one is queued, the previous one has
+        # finished, so its GPU tensors are released (a layer's gate|up is copied before the
+        # next layer allocates its own). The previous copy started a layer's worth of work
+        # earlier, so this wait is normally already over.
+        while self.in_flight:
             self.in_flight.pop(0).synchronize()
+        self.in_flight.append(done)
         if handle is not None:
             handle["hosts"].extend(hosts)
             handle["d2h"] = done  # the copy stream is in order: this one ends after the rest
