@@ -314,73 +314,6 @@ def _code(quant_state):
     return _CODE[key]
 
 
-WEIGHT_CHUNKS = 4  # the large MLP weights are dequantized a quarter at a time (memory)
-
-
-def _weight_rows(layer, dtype, streamed, r0, r1):
-    """Rows r0:r1 of one NF4 weight in `dtype` (a contiguous piece of its packed bytes and
-    absmax), or None when the piece does not fall on whole dequantization blocks."""
-    qs = layer.weight.quant_state
-    cols = int(qs.shape[1])
-    if (r0 * cols) % DEQUANT_BLOCK or (r1 * cols) % DEQUANT_BLOCK or \
-            (r0 * cols) % qs.blocksize:
-        return None
-    if streamed is not None:
-        packed, absmax = streamed[0]
-    else:
-        device = layer.weight.device
-        from .nf4 import _absmax_fp32
-
-        if getattr(qs, "_soup_host", None) is not None:
-            from .offload import fetch
-
-            packed = fetch(qs, device)
-        else:
-            packed = layer.weight.view(-1)
-        absmax = _absmax_fp32(qs)[0]
-    e0, e1 = r0 * cols, r1 * cols
-    out = torch.empty((r1 - r0, cols), dtype=dtype, device=packed.device)
-    piece_p, piece_a = packed[e0 // 2:e1 // 2], absmax[e0 // qs.blocksize:e1 // qs.blocksize]
-    nf4_dequant_multi_kernel[((e1 - e0) // DEQUANT_BLOCK,)](
-        piece_p, piece_a, piece_p, piece_a, piece_p, piece_a, _code(qs), out,
-        (e1 - e0) // DEQUANT_BLOCK, 0, QBLOCK=qs.blocksize, BLOCK=DEQUANT_BLOCK)
-    return out
-
-
-def _row_chunks(rows):
-    step = rows // WEIGHT_CHUNKS
-    if step == 0 or rows % WEIGHT_CHUNKS:
-        return [(0, rows)]
-    return [(r0, r0 + step) for r0 in range(0, rows, step)]
-
-
-def _mm_rows_out(a, layer, dtype, streamed, out):
-    """out[:, rows] = a @ W[rows]^T for each row piece of the weight W (out is [N, out_features],
-    written in column pieces): the full fp16 weight never exists at once."""
-    rows = int(layer.weight.quant_state.shape[0])
-    for r0, r1 in _row_chunks(rows):
-        w = _weight_rows(layer, dtype, streamed, r0, r1)
-        if w is None:  # not on block boundaries: the whole weight
-            torch.mm(a, _dequant((layer,), dtype, streamed).t(), out=out)
-            return out
-        torch.mm(a, w.t(), out=out[:, r0:r1])
-        del w
-    return out
-
-
-def _mm_rows_in(g, layer, dtype, streamed, acc):
-    """acc += g @ W for each row piece of W (g's columns matching), acc in fp32."""
-    rows = int(layer.weight.quant_state.shape[0])
-    for r0, r1 in _row_chunks(rows):
-        w = _weight_rows(layer, dtype, streamed, r0, r1)
-        if w is None:
-            acc.add_(torch.mm(g, _dequant((layer,), dtype, streamed)))
-            return acc
-        acc.add_(torch.mm(g[:, r0:r1], w))
-        del w
-    return acc
-
-
 def _dequant(layers, dtype, streamed=None):
     """The stacked weights of up to three NF4 layers ([sum of out_features, in_features]).
     `streamed`: [(packed, absmax_fp32)] on the GPU for these layers (offload.py), else each
@@ -704,25 +637,21 @@ class FusedDecoderLayer(torch.autograd.Function):
         # MLP block
         y2, rstd2 = _norm(x, o16, layer.post_attention_layernorm.weight,
                           float(layer.post_attention_layernorm.variance_epsilon), dtype)
-        inter = int(mlp.gate_proj.weight.quant_state.shape[0])
-        gu = torch.empty((n, 2 * inter), dtype=dtype, device=x.device)
-        _mm_rows_out(y2, mlp.gate_proj, dtype, w_gu[0:1] if w_gu else None, gu[:, :inter])
-        _mm_rows_out(y2, mlp.up_proj, dtype, w_gu[1:2] if w_gu else None, gu[:, inter:])
+        gu = torch.mm(y2, _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu).t())
         del y2
+        inter = gu.shape[1] // 2
         act = torch.empty((n, inter), dtype=dtype, device=x.device)
         gate_up_act_fwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](gu, act, inter, BLOCK=ACT_BLOCK)
         # gate|up (35 KB per token) is not kept on the GPU in "recompute" layers: with the
         # activation store it goes to host memory with the rest (the copy engines are idle
         # enough), otherwise the backward pass recomputes it (one more large GEMM).
         gu_host = spec.recompute_mlp and offload and mlp_to_host(spec.index)
-        handle_gu = None
-        if gu_host:  # its own handle: the backward pass fetches it later than the rest
-            handle_gu = spec.store.save([gu])
+        if gu_host:
+            spec.store.save([gu], handle)
         if spec.recompute_mlp or gu_host:
             del gu
             gu = None
-        d16 = torch.empty((n, hidden), dtype=dtype, device=x.device)
-        _mm_rows_out(act, mlp.down_proj, dtype, w_d, d16)
+        d16 = torch.mm(act, _dequant((mlp.down_proj,), dtype, w_d).t())
         sample_memory("layer forward", x.device)
         del act
         h2 = x + o16  # the residual stream after attention, in fp32 as in the base run
@@ -736,10 +665,9 @@ class FusedDecoderLayer(torch.autograd.Function):
         # that 9 KB per token cross PCIe each way instead of 16 KB. gate|up: on the GPU, in
         # host memory, or recomputed.
         ctx.gu_host = gu_host
-        ctx.handle, ctx.handle_gu = handle, handle_gu
+        ctx.handle = handle
         if offload:
             spec.u.handles[spec.index] = handle
-            _gu_handles(spec.u)[spec.index] = handle_gu
             big = [rstd2, rstd2, rstd2]  # placeholders: the tensors travel to host memory
         else:
             big = [x, out, packed]
@@ -752,20 +680,17 @@ class FusedDecoderLayer(torch.autograd.Function):
         (x, out, packed, gu, a_q, a_v, rstd1, rstd2, aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
         spec, u, dtype = ctx.spec, ctx.spec.u, ctx.spec.dtype
         if spec.store is not None:
-            if spec.last:  # the step's backward pass starts: drop what forward and head cached
-                torch.cuda.empty_cache()
             if ctx.handle is not None:
                 spec.store.prefetch(ctx.handle)
-            if ctx.handle_gu is not None:
-                spec.store.prefetch(ctx.handle_gu)
-            if spec.index > 0:  # the next layer's small tensors, while this one computes
+            if spec.index > 0:  # the next layer of the backward pass, while this one computes
                 spec.store.prefetch(u.handles.get(spec.index - 1))
             if ctx.handle is not None:
-                x, out, packed = spec.store.load(ctx.handle)
+                loaded = spec.store.load(ctx.handle)
+                x, out, packed = loaded[0], loaded[1], loaded[2]
+                if ctx.gu_host:
+                    gu = loaded[3]
+                del loaded
                 ctx.handle = None
-            if ctx.handle_gu is not None:
-                (gu,) = spec.store.load(ctx.handle_gu)
-                ctx.handle_gu = None
         recompute = spec.recompute_mlp and not ctx.gu_host
         ws = spec.weights.acquire(spec.index, spec.index - 1) if spec.weights else None
         w_qkv, w_o, w_gu, w_d = (ws[0:3], ws[3:4], ws[4:6], ws[6:7]) if ws else (None,) * 4
@@ -781,43 +706,34 @@ class FusedDecoderLayer(torch.autograd.Function):
         wo = _dequant((op,), dtype, w_o)
         o16 = torch.mm(out.reshape(n, heads * dim), wo.t())
 
-        # MLP block (the large weights dequantized a quarter at a time)
-        w_gate = w_gu[0:1] if w_gu else None
-        w_up = w_gu[1:2] if w_gu else None
+        # MLP block
+        w_gu_full = None
         if recompute:
             y2, _ = _norm(x, o16, norm2.weight, float(norm2.variance_epsilon), dtype)
-            gu = torch.empty((n, 2 * inter), dtype=dtype, device=x.device)
-            _mm_rows_out(y2, mlp.gate_proj, dtype, w_gate, gu[:, :inter])
-            _mm_rows_out(y2, mlp.up_proj, dtype, w_up, gu[:, inter:])
+            w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
+            gu = torch.mm(y2, w_gu_full.t())
             del y2
-        # d_act = dh2 @ W_down, W_down's rows (the hidden dim) a quarter at a time
-        dh2_16 = dh2.to(dtype)
-        d_act = None
-        for r0, r1 in _row_chunks(hidden):
-            w = _weight_rows(mlp.down_proj, dtype, w_d, r0, r1)
-            if w is None:
-                d_act = torch.mm(dh2_16, _dequant((mlp.down_proj,), dtype, w_d))
-                break
-            if d_act is None:
-                d_act = torch.mm(dh2_16[:, r0:r1], w)
-            else:
-                d_act.addmm_(dh2_16[:, r0:r1], w)
-            del w
-        del dh2_16
+        d_act = torch.mm(dh2.to(dtype), _dequant((mlp.down_proj,), dtype, w_d))
         # the gradient of gate|up overwrites gate|up (each element is read, then written)
         gate_up_act_bwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](d_act, gu, gu, inter,
                                                                    BLOCK=ACT_BLOCK)
         d_gu = gu
         del d_act, gu
-        # dy2 = d_gate @ W_gate + d_up @ W_up, summed in fp32 over weight pieces
-        dy2_32 = torch.zeros((n, hidden), dtype=torch.float32, device=x.device)
-        _mm_rows_in(d_gu[:, :inter], mlp.gate_proj, dtype, w_gate, dy2_32)
-        _mm_rows_in(d_gu[:, inter:], mlp.up_proj, dtype, w_up, dy2_32)
-        dy2 = dy2_32.to(dtype)
+        # dy2 = d_gate @ W_gate + d_up @ W_up: one weight dequantized at a time
+        if w_gu_full is not None:
+            w_gate, w_up = w_gu_full[:inter], w_gu_full[inter:]
+            dy2 = torch.mm(d_gu[:, :inter], w_gate)
+            dy2.addmm_(d_gu[:, inter:], w_up)
+            del w_gate, w_up
+        else:
+            w_half = _dequant((mlp.gate_proj,), dtype, w_gu[0:1] if w_gu else None)
+            dy2 = torch.mm(d_gu[:, :inter], w_half)
+            del w_half
+            w_half = _dequant((mlp.up_proj,), dtype, w_gu[1:2] if w_gu else None)
+            dy2.addmm_(d_gu[:, inter:], w_half)
+            del w_half
         sample_memory("layer backward", x.device)
-        del d_gu, dy2_32
-        if spec.store is not None and spec.index > 0:  # the next layer's gate|up, now
-            spec.store.prefetch(_gu_handles(u).get(spec.index - 1))
+        del d_gu, w_gu_full
         dh1 = _norm_bwd(dy2, None, None, None, x, o16, norm2.weight, rstd2, dh2,
                         1.0, 1.0)
         del dy2, o16
@@ -874,13 +790,6 @@ class FusedDecoderLayer(torch.autograd.Function):
             dx = _norm_bwd(dy, dd_q, dd_v, packed, x, None, norm1.weight, rstd1,
                            dh1, 1.0 / (1.0 - p_q), 1.0 / (1.0 - p_v))
         return dx, grad_aq, grad_bq, grad_av, grad_bv, None
-
-
-def _gu_handles(u):
-    handles = getattr(u, "handles_gu", None)
-    if handles is None:
-        handles = u.handles_gu = {}
-    return handles
 
 
 # ================================================================================ wiring
@@ -1043,7 +952,7 @@ def _sub_batch(u, m):
     sub.segments = segments
     sub.cu_seqlens = torch.tensor(bounds, dtype=torch.int32).to(u.rows.device)
     sub.max_seqlen = max(stop - start for start, stop in segments)
-    sub.handles, sub.handles_gu = {}, {}
+    sub.handles = {}
     return sub
 
 
@@ -1196,7 +1105,7 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
                    f"weights {'streamed' if stream else 'fetched'}"
             try:
                 _Attention.mode = mode
-                sub.handles, sub.handles_gu = {}, {}
+                sub.handles = {}
                 if keep_host:
                     store.begin_step(host_bytes(m, 2, layer.mlp.config.intermediate_size,
                                                 xin.shape[1]))
