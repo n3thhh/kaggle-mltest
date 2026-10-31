@@ -19,20 +19,15 @@ INTER = 8960     # its MLP's intermediate size
 HEADS, KV, HEAD_DIM = 12, 2, 128
 
 
-def _compile_all(offline=False, part=0, parts=1):
-    """Every kernel the training steps use, for their exact argument types. In the process
-    itself the kernels are launched once on zero tensors (compiled, or read from the compile
-    cache, and loaded). `offline`: in a helper process without a GPU, compile only (into the
-    shared cache directory), the share `part` of `parts`."""
+def _compile_all():
+    """Every kernel the training steps use, launched once on zero tensors with the exact
+    argument types of the training steps (compiled and loaded)."""
     import torch
 
     from . import fused_ce, head_stream, layer, offload, rmsnorm
 
-    if offline:
-        dev = torch.device("cpu")
-    else:
-        dev = torch.device("cuda", 0)
-        torch.cuda.set_device(dev)
+    dev = torch.device("cuda", 0)
+    torch.cuda.set_device(dev)
     f16, f32, i64 = torch.float16, torch.float32, torch.int64
 
     def t(n, dtype):
@@ -115,25 +110,16 @@ def _compile_all(offline=False, part=0, parts=1):
     jobs.append(host_memory)
     import time
 
-    if offline:
-        jobs = [job for i, job in enumerate(jobs)
-                if job not in (attention, host_memory) and i % parts == part]
-    else:
-        TIMES["start"] = time.perf_counter()
-        _wait_helpers()
-        TIMES["helpers_done"] = time.perf_counter()
-        _count_cache_hits()
+    TIMES["start"] = time.perf_counter()
+    _count_cache_hits()
     for i, job in enumerate(jobs):
         began = time.perf_counter()
         try:
             job()
         except Exception as exc:  # noqa: BLE001 - a kernel not warmed up compiles at first use
-            if not offline:
-                TIMES.setdefault("errors", []).append(repr(exc)[:200])
-        if not offline:
-            TIMES.setdefault("jobs", []).append((round(time.perf_counter() - began, 2), i))
-    if not offline:
-        TIMES["done"] = time.perf_counter()
+            TIMES.setdefault("errors", []).append(repr(exc)[:200])
+        TIMES.setdefault("jobs", []).append((round(time.perf_counter() - began, 2), i))
+    TIMES["done"] = time.perf_counter()
 
 
 def _count_cache_hits():
@@ -154,101 +140,6 @@ def _count_cache_hits():
         pass
 
 
-# --- compiling in helper processes --------------------------------------------------------------
-#
-# Triton's compiler runs partly in Python: compiling in a thread of the training process holds the
-# GIL for seconds while that process imports libraries and loads the model. So two helper processes
-# (the T4 machines have 4 CPUs) compile the kernels into Triton's cache directory of this run
-# (TRITON_CACHE_DIR, inherited), for the T4's target (sm_75) without touching the GPU, together
-# with their C launchers (built by the C compiler, about 0.5 s each); the thread here then only
-# reads them from the cache and loads them. Should the helpers fail
-# or produce other cache keys, the thread compiles as before.
-
-HELPERS = []
-HELPER_PARTS = 2
-_HELPER_CODE = r"""
-import sys
-sys.path.insert(0, sys.argv[1])
-from triton.backends.compiler import GPUTarget
-from triton.runtime.driver import driver
-from triton.runtime.jit import JITFunction
-
-
-class _Target:  # the T4, without initialising CUDA
-    def get_current_device(self):
-        return 0
-
-    def get_current_stream(self, device=None):
-        return 0
-
-    def get_current_target(self):
-        return GPUTarget("cuda", 75, 32)
-
-
-driver.set_active(_Target())
-_run = JITFunction.run
-
-
-def _compile_only(self, *args, grid, warmup, **kwargs):
-    kernel = _run(self, *args, grid=grid, warmup=True, **kwargs)
-    try:  # the kernel's C launcher (built with the C compiler, cached by its source)
-        from triton.backends.nvidia.driver import CudaLauncher
-
-        CudaLauncher(kernel.src, kernel.metadata)
-    except Exception:
-        pass
-    return kernel
-
-
-JITFunction.run = _compile_only
-if sys.argv[2] == "0":
-    try:  # Triton's CUDA helper module, also built with the C compiler at first use
-        from triton.backends.nvidia.driver import CudaUtils
-
-        CudaUtils()
-    except Exception:
-        pass
-from solution import warmup
-
-warmup._compile_all(offline=True, part=int(sys.argv[2]), parts=int(sys.argv[3]))
-"""
-
-
-def _start_helpers():
-    import os
-    import subprocess
-    import sys
-
-    if os.environ.get("SOUP_SOLUTION_COMPILE_HELPERS", "1") != "1":
-        return
-    try:
-        import torch
-
-        major, minor = torch.cuda.get_device_capability(0)
-        if (major, minor) != (7, 5):
-            return  # the helpers compile for the T4 only
-    except Exception:  # noqa: BLE001
-        return
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    for part in range(HELPER_PARTS):
-        try:
-            HELPERS.append(subprocess.Popen(
-                [sys.executable, "-c", _HELPER_CODE, root, str(part), str(HELPER_PARTS)],
-                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _wait_helpers():
-    for proc in HELPERS:
-        try:
-            proc.wait(timeout=30)
-        except Exception:  # noqa: BLE001 - too slow: the thread compiles what is missing
-            proc.kill()
-    TIMES["helpers"] = [proc.returncode for proc in HELPERS]
-
-
 def start():
     global _THREAD
     try:
@@ -258,7 +149,6 @@ def start():
             return
     except Exception:  # noqa: BLE001
         return
-    _start_helpers()
     _THREAD = threading.Thread(target=_compile_all, name="soup-kernel-warmup", daemon=True)
     _THREAD.start()
 
@@ -273,8 +163,7 @@ def wait():
         import sys
 
         start, done = TIMES.get("start"), TIMES.get("done")
-        print(f"[solution] kernel warm-up: {done - start:.2f} s in the background (helper "
-              f"processes {TIMES.get('helpers')}: {TIMES.get('helpers_done', start) - start:.2f} s),"
+        print(f"[solution] kernel warm-up: {done - start:.2f} s in the background,"
               f" the first step waited {TIMES['waited']:.2f} s, compile cache {TIMES.get('cache')},"
               f" slowest jobs {sorted(TIMES.get('jobs', []), reverse=True)[:6]},"
               f" errors: {TIMES.get('errors', [])}"
