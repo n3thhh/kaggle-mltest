@@ -24,9 +24,9 @@ launches and its backward pass about 35, written out by hand:
   rotated q, k, v, attention's output and its log-sum-exp, and optionally gate/up (mlp.py decides
   per batch: long batches recompute them). Everything else is recomputed by cheap kernels.
 
-The arithmetic follows the base run's: every GEMM is the fp16 GEMM autocast runs there, sums
-that the base run does in fp32 are done in fp32, and values the base run rounds to fp16 are
-rounded to fp16 at the same points.
+The arithmetic follows the base run's: every GEMM is the fp16 GEMM autocast runs there (except
+the int8 MLP GEMMs, see "int8 GEMMs" below), sums that the base run does in fp32 are done in fp32,
+and values the base run rounds to fp16 are rounded to fp16 at the same points.
 """
 
 import torch
@@ -296,6 +296,152 @@ def gate_up_act_bwd_kernel(dh_ptr, gu_ptr, dgu_ptr, inter, BLOCK: tl.constexpr):
     tl.store(dgu_ptr + base + inter + cols, d_up.to(dgu_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _round_int8(v):
+    """Round half away from zero, clamped to [-127, 127], as int8."""
+    r = tl.where(v >= 0, tl.floor(v + 0.5), -tl.floor(0.5 - v))
+    return tl.minimum(tl.maximum(r, -127.0), 127.0).to(tl.int8)
+
+
+@triton.jit
+def nf4_int8_rows_kernel(p0, a0, p1, a1, code_ptr, q_ptr, s_ptr, rows0, cols,
+                         QBLOCK: tl.constexpr, BLOCK: tl.constexpr):
+    """Row r of up to two stacked NF4 weights (gate, then up) [rows, cols]: dequantized as in
+    nf4_dequant_multi_kernel (code * absmax of its block), then rounded to int8 with one scale per
+    row, its largest |value| / 127. The weight operand of the int8 forward GEMM ([out, in] row
+    major is what the tensor cores' int8 GEMM reads)."""
+    r = tl.program_id(0)
+    if r < rows0:
+        packed = p0
+        absmax = a0
+        local = r
+    else:
+        packed = p1
+        absmax = a1
+        local = r - rows0
+    local = local.to(tl.int64)
+    half = tl.arange(0, BLOCK // 2)
+    byte = tl.load(packed + local * (cols // 2) + half, mask=half < cols // 2, other=0)
+    byte = byte.to(tl.int32)
+    value = tl.interleave(tl.load(code_ptr + ((byte >> 4) & 0xF)), tl.load(code_ptr + (byte & 0xF)))
+    blk = tl.arange(0, BLOCK // QBLOCK)
+    scale = tl.load(absmax + local * (cols // QBLOCK) + blk, mask=blk < cols // QBLOCK, other=0.0)
+    value = tl.reshape(tl.reshape(value, (BLOCK // QBLOCK, QBLOCK)) * scale[:, None], (BLOCK,))
+    top = tl.maximum(tl.max(tl.abs(value), axis=0), 1e-20)
+    cols_ = tl.arange(0, BLOCK)
+    tl.store(q_ptr + r.to(tl.int64) * cols + cols_, _round_int8(value * (127.0 / top)),
+             mask=cols_ < cols)
+    tl.store(s_ptr + r, top / 127.0)
+
+
+@triton.jit
+def nf4_int8_t_kernel(p0, a0, p1, a1, code_ptr, cs_ptr, q_ptr, rows0, rows, cols,
+                      QBLOCK: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """A [BN rows, BK columns] tile of up to two stacked NF4 weights [rows, cols], dequantized,
+    divided by its column's scale (the column's largest |value| / 127, fixed for the run), rounded
+    to int8 and stored transposed, [cols, rows]: the weight operand of the int8 input-gradient
+    GEMM (dx = dy @ W needs W column major)."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n0 = pid_n * BN
+    if n0 < rows0:
+        packed = p0
+        absmax = a0
+        local0 = n0
+    else:
+        packed = p1
+        absmax = a1
+        local0 = n0 - rows0
+    nn = tl.arange(0, BN)
+    local = (local0 + nn).to(tl.int64)
+    kh = pid_k * (BK // 2) + tl.arange(0, BK // 2)
+    byte = tl.load(packed + local[:, None] * (cols // 2) + kh[None, :]).to(tl.int32)
+    value = tl.interleave(tl.load(code_ptr + ((byte >> 4) & 0xF)), tl.load(code_ptr + (byte & 0xF)))
+    kb = pid_k * (BK // QBLOCK) + tl.arange(0, BK // QBLOCK)
+    amax = tl.load(absmax + local[:, None] * (cols // QBLOCK) + kb[None, :])
+    value = tl.reshape(tl.reshape(value, (BN, BK // QBLOCK, QBLOCK)) * amax[:, :, None], (BN, BK))
+    kk = pid_k * BK + tl.arange(0, BK)
+    q = _round_int8(value / tl.load(cs_ptr + kk)[None, :])
+    out = (n0 + nn).to(tl.int64)
+    tl.store(q_ptr + kk[:, None].to(tl.int64) * rows + out[None, :], tl.trans(q))
+
+
+@triton.jit
+def row_quant_kernel(x_ptr, q_ptr, s_ptr, n_cols, BLOCK: tl.constexpr):
+    """One row to int8 with one scale (its largest |value| / 127): the activation operand of an
+    int8 GEMM."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+    top = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-20)
+    tl.store(q_ptr + row * n_cols + cols, _round_int8(x * (127.0 / top)), mask=mask)
+    tl.store(s_ptr + row, top / 127.0)
+
+
+@triton.jit
+def gate_up_act_fwd_i8_kernel(acc_ptr, sx_ptr, sw_ptr, gu_ptr, h_ptr, inter,
+                              BLOCK: tl.constexpr):
+    """The int8 gate|up GEMM's int32 output back to values (row scale of the input times row
+    scale of the weight), rounded to fp16 like the base run's GEMM output and kept for the
+    backward pass, and silu(gate) * up in fp32 from those, rounded once for the down GEMM."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < inter
+    base = row * 2 * inter
+    sx = tl.load(sx_ptr + row)
+    gate = tl.load(acc_ptr + base + cols, mask=mask, other=0).to(tl.float32) * sx * \
+        tl.load(sw_ptr + cols, mask=mask, other=0.0)
+    up = tl.load(acc_ptr + base + inter + cols, mask=mask, other=0).to(tl.float32) * sx * \
+        tl.load(sw_ptr + inter + cols, mask=mask, other=0.0)
+    gate16 = gate.to(gu_ptr.dtype.element_ty)
+    up16 = up.to(gu_ptr.dtype.element_ty)
+    tl.store(gu_ptr + base + cols, gate16, mask=mask)
+    tl.store(gu_ptr + base + inter + cols, up16, mask=mask)
+    gate = gate16.to(tl.float32)
+    act = gate / (1.0 + tl.exp(-gate))
+    tl.store(h_ptr + row * inter + cols, (act * up16.to(tl.float32)).to(h_ptr.dtype.element_ty),
+             mask=mask)
+
+
+@triton.jit
+def gate_up_act_bwd_i8_kernel(acc_ptr, sd_ptr, cs_ptr, gu_ptr, q_ptr, s_ptr,
+                              INTER: tl.constexpr, BLOCK: tl.constexpr):
+    """One token: the gradient of silu(gate) * up from the int8 input-gradient GEMM of the down
+    projection (int32 times the row scale of the incoming gradient and the column scale of the
+    weight), then the gradients of gate and up in fp32 as in gate_up_act_bwd_kernel, written as
+    int8 with one scale per token for the next int8 GEMM: the first pass finds the token's
+    largest |gradient|, the second recomputes the gradients and rounds them."""
+    row = tl.program_id(0).to(tl.int64)
+    sd = tl.load(sd_ptr + row)
+    base = row * 2 * INTER
+    top = tl.zeros([BLOCK], dtype=tl.float32)
+    for start in range(0, INTER, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < INTER
+        dh = tl.load(acc_ptr + row * INTER + cols, mask=mask, other=0).to(tl.float32) * sd * \
+            tl.load(cs_ptr + cols, mask=mask, other=0.0)
+        gate = tl.load(gu_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gu_ptr + base + INTER + cols, mask=mask, other=0.0).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        top = tl.maximum(top, tl.abs(dh * gate * sig))
+        top = tl.maximum(top, tl.abs(dh * up * sig * (1.0 + gate * (1.0 - sig))))
+    peak = tl.maximum(tl.max(top, axis=0), 1e-20)
+    inv = 127.0 / peak
+    for start in range(0, INTER, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < INTER
+        dh = tl.load(acc_ptr + row * INTER + cols, mask=mask, other=0).to(tl.float32) * sd * \
+            tl.load(cs_ptr + cols, mask=mask, other=0.0)
+        gate = tl.load(gu_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gu_ptr + base + INTER + cols, mask=mask, other=0.0).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(q_ptr + base + cols, _round_int8(dh * up * sig * (1.0 + gate * (1.0 - sig)) * inv),
+                 mask=mask)
+        tl.store(q_ptr + base + INTER + cols, _round_int8(dh * gate * sig * inv), mask=mask)
+    tl.store(s_ptr + row, peak / 127.0)
+
+
 ACT_BLOCK = 1024
 ROW_BLOCK = 1024
 
@@ -323,20 +469,7 @@ def _dequant(layers, dtype, streamed=None):
     cols = int(states[0].shape[1])
     device = streamed[0][0].device if streamed else layers[0].weight.device
     out = torch.empty((rows, cols), dtype=dtype, device=device)
-    if streamed is None:
-        sources = []
-        for layer, qs in zip(layers, states):
-            if getattr(qs, "_soup_host", None) is not None:
-                from .offload import fetch
-                from .nf4 import _absmax_fp32
-
-                sources.append((fetch(qs, device), _absmax_fp32(qs)[0]))
-            else:
-                from .nf4 import _absmax_fp32
-
-                sources.append((layer.weight.view(-1), _absmax_fp32(qs)[0]))
-    else:
-        sources = list(streamed)
+    sources = _sources(layers, streamed, device)
     numels = [int(s.shape[0]) * cols for s in states]
     if all(n % DEQUANT_BLOCK == 0 for n in numels):
         blocks = [n // DEQUANT_BLOCK for n in numels] + [0, 0]
@@ -358,6 +491,127 @@ def _dequant(layers, dtype, streamed=None):
                 BLOCK=DEQUANT_BLOCK)
             start = stop
     return out
+
+
+def _sources(layers, streamed, device):
+    """[(packed bytes, absmax fp32)] of each layer on the GPU: the streamed copies, else each
+    layer's own (fetched from host memory if it lives there)."""
+    if streamed is not None:
+        return list(streamed)
+    from .nf4 import _absmax_fp32
+
+    sources = []
+    for layer in layers:
+        qs = layer.weight.quant_state
+        if getattr(qs, "_soup_host", None) is not None:
+            from .offload import fetch
+
+            sources.append((fetch(qs, device), _absmax_fp32(qs)[0]))
+        else:
+            sources.append((layer.weight.view(-1), _absmax_fp32(qs)[0]))
+    return sources
+
+
+# ---------------------------------------------------------------- int8 GEMMs
+#
+# The T4's tensor cores multiply int8 about 1.5 times faster than fp16 at this layer's shapes
+# (measured with torch._int_mm: 2.6 ms instead of 3.9 ms for gate|up at 1,536 tokens). The
+# organizers allow int8 GEMMs on weights made from the NF4 weights, forward and for input
+# gradients. Measured on the real model (W8A8, per-row scales): int8 in every projection moves the
+# loss by +3.1 % (the first step allows 1 %), int8 in gate|up only by +0.3 %. So:
+#   forward   gate|up (60 % of the layer's GEMM work) in int8; q|k|v, o and down stay fp16
+#   backward  the input gradients of down and of gate|up (90 % of the backward GEMM work) in int8;
+#             they do not enter the loss, only the gradients that reach LoRA
+# Weights: int8 made from the NF4 bytes on the GPU at each use (as the fp16 ones are), one scale
+# per output row for the forward GEMM, one per input column (fixed for the run) for the
+# input-gradient GEMM. Activations and gradients: one scale per token. A self-check at the first
+# step compares the layer with fp32 and turns int8 off if it is off by more than allowed.
+INT8 = True
+INT8_CHUNK = 512  # tokens per int8 GEMM: bounds its int32 output (36 MB for gate|up)
+_COLSCALE = {}
+
+
+def int8_eligible(layer):
+    """The shapes the int8 kernels tile exactly (Qwen2.5-1.5B: 1536 and 8960)."""
+    mlp = layer.mlp
+    hidden, inter = int(mlp.gate_proj.in_features), int(mlp.gate_proj.out_features)
+    qblock = mlp.gate_proj.weight.quant_state.blocksize
+    return (hidden % 128 == 0 and inter % 128 == 0 and 128 % qblock == 0 and
+            int(mlp.down_proj.in_features) == inter and
+            all(m.weight.quant_state.blocksize == qblock
+                for m in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
+
+
+def _chunks(n, size=INT8_CHUNK):
+    """Row ranges of at most `size` (+16) tokens starting at multiples of `size`; none of 16
+    tokens or fewer (torch._int_mm needs more)."""
+    bounds = list(range(0, n, size)) + [n]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] <= 16:
+        del bounds[-2]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def _row_quant(x):
+    n, cols = x.shape
+    q = torch.empty((n, cols), dtype=torch.int8, device=x.device)
+    s = torch.empty(n, dtype=torch.float32, device=x.device)
+    row_quant_kernel[(n,)](x, q, s, cols, BLOCK=triton.next_power_of_2(cols),
+                           num_warps=8 if cols >= 4096 else 4)
+    return q, s
+
+
+def _int8_rows(layers, streamed):
+    """Up to two stacked NF4 weights as int8 [rows, cols] with one fp32 scale per row."""
+    states = [layer.weight.quant_state for layer in layers]
+    rows0 = int(states[0].shape[0])
+    rows = sum(int(s.shape[0]) for s in states)
+    cols = int(states[0].shape[1])
+    device = streamed[0][0].device if streamed else layers[0].weight.device
+    src = _sources(layers, streamed, device)
+    if len(src) < 2:
+        src.append(src[0])
+    q = torch.empty((rows, cols), dtype=torch.int8, device=device)
+    s = torch.empty(rows, dtype=torch.float32, device=device)
+    nf4_int8_rows_kernel[(rows,)](src[0][0], src[0][1], src[1][0], src[1][1], _code(states[0]),
+                                  q, s, rows0, cols, QBLOCK=states[0].blocksize,
+                                  BLOCK=triton.next_power_of_2(cols))
+    return q, s
+
+
+def _int8_t(layers, streamed, col_scale):
+    """Up to two stacked NF4 weights [rows, cols] as int8, transposed ([cols, rows]), divided by
+    the fixed per-column scales."""
+    states = [layer.weight.quant_state for layer in layers]
+    rows0 = int(states[0].shape[0])
+    rows = sum(int(s.shape[0]) for s in states)
+    cols = int(states[0].shape[1])
+    device = streamed[0][0].device if streamed else layers[0].weight.device
+    src = _sources(layers, streamed, device)
+    if len(src) < 2:
+        src.append(src[0])
+    q = torch.empty((cols, rows), dtype=torch.int8, device=device)
+    bn, bk = 64, 128
+    nf4_int8_t_kernel[(rows // bn, cols // bk)](src[0][0], src[0][1], src[1][0], src[1][1],
+                                                _code(states[0]), col_scale, q, rows0, rows, cols,
+                                                QBLOCK=states[0].blocksize, BN=bn, BK=bk)
+    return q
+
+
+def _col_scales(mlp, dtype, w_gu, w_d):
+    """Per input column, the largest |weight| / 127 of gate|up (over 2 x 8960 rows) and of down
+    (over 1536 rows): the scales of the int8 input-gradient GEMMs. Computed once per layer, at its
+    first forward pass, from the fp16 weights both runs multiply with."""
+    hit = _COLSCALE.get(id(mlp))
+    if hit is not None and hit[0] is mlp:
+        return hit[1], hit[2]
+    scales = []
+    for layers, streamed in (((mlp.gate_proj, mlp.up_proj), w_gu), ((mlp.down_proj,), w_d)):
+        w = _dequant(layers, dtype, streamed)
+        top = torch.maximum(w.amax(0), -w.amin(0)).float()
+        del w
+        scales.append(top.clamp_min_(1e-20).div_(127.0))
+    _COLSCALE[id(mlp)] = (mlp, scales[0], scales[1])
+    return scales[0], scales[1]
 
 
 _CAST = {}
@@ -586,7 +840,7 @@ class LayerSpec:
     """What a layer's autograd function needs besides tensors."""
 
     __slots__ = ("layer", "u", "cos", "sin", "dtype", "recompute_mlp", "index", "weights",
-                 "store", "last")
+                 "store", "last", "int8")
 
 
 class FusedDecoderLayer(torch.autograd.Function):
@@ -637,11 +891,27 @@ class FusedDecoderLayer(torch.autograd.Function):
         # MLP block
         y2, rstd2 = _norm(x, o16, layer.post_attention_layernorm.weight,
                           float(layer.post_attention_layernorm.variance_epsilon), dtype)
-        gu = torch.mm(y2, _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu).t())
-        del y2
-        inter = gu.shape[1] // 2
-        act = torch.empty((n, inter), dtype=dtype, device=x.device)
-        gate_up_act_fwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](gu, act, inter, BLOCK=ACT_BLOCK)
+        if spec.int8:
+            _col_scales(mlp, dtype, w_gu, w_d)  # once per layer and run, for the backward pass
+            x8, sx = _row_quant(y2)
+            del y2
+            w8, sw = _int8_rows((mlp.gate_proj, mlp.up_proj), w_gu)
+            inter = w8.shape[0] // 2
+            gu = torch.empty((n, 2 * inter), dtype=dtype, device=x.device)
+            act = torch.empty((n, inter), dtype=dtype, device=x.device)
+            for r0, r1 in _chunks(n):
+                acc = torch._int_mm(x8[r0:r1], w8.t())
+                gate_up_act_fwd_i8_kernel[(r1 - r0, triton.cdiv(inter, ACT_BLOCK))](
+                    acc, sx[r0:r1], sw, gu[r0:r1], act[r0:r1], inter, BLOCK=ACT_BLOCK)
+                del acc
+            del x8, sx, w8, sw
+        else:
+            gu = torch.mm(y2, _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu).t())
+            del y2
+            inter = gu.shape[1] // 2
+            act = torch.empty((n, inter), dtype=dtype, device=x.device)
+            gate_up_act_fwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](gu, act, inter,
+                                                                       BLOCK=ACT_BLOCK)
         # gate|up (35 KB per token) is not kept on the GPU in "recompute" layers: with the
         # activation store it goes to host memory with the rest (the copy engines are idle
         # enough), otherwise the backward pass recomputes it (one more large GEMM).
@@ -665,6 +935,7 @@ class FusedDecoderLayer(torch.autograd.Function):
         # that 9 KB per token cross PCIe each way instead of 16 KB. gate|up: on the GPU, in
         # host memory, or recomputed.
         ctx.gu_host = gu_host
+        ctx.int8 = spec.int8
         ctx.handle = handle
         if offload:
             spec.u.handles[spec.index] = handle
@@ -713,27 +984,50 @@ class FusedDecoderLayer(torch.autograd.Function):
             w_gu_full = _dequant((mlp.gate_proj, mlp.up_proj), dtype, w_gu)
             gu = torch.mm(y2, w_gu_full.t())
             del y2
-        d_act = torch.mm(dh2.to(dtype), _dequant((mlp.down_proj,), dtype, w_d))
-        # the gradient of gate|up overwrites gate|up (each element is read, then written)
-        gate_up_act_bwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](d_act, gu, gu, inter,
-                                                                   BLOCK=ACT_BLOCK)
-        d_gu = gu
-        del d_act, gu
-        # dy2 = d_gate @ W_gate + d_up @ W_up: one weight dequantized at a time
-        if w_gu_full is not None:
-            w_gate, w_up = w_gu_full[:inter], w_gu_full[inter:]
-            dy2 = torch.mm(d_gu[:, :inter], w_gate)
-            dy2.addmm_(d_gu[:, inter:], w_up)
-            del w_gate, w_up
+        if ctx.int8:
+            # dh2 -> d_act (int8 GEMM on down's transposed int8 weight, a chunk of tokens at a
+            # time) -> d_gate|d_up as int8 with one scale per token -> dy2 (int8 GEMM)
+            del w_gu_full
+            cs_gu, cs_d = _col_scales(mlp, dtype, w_gu, w_d)
+            dh8, sdh = _row_quant(dh2)
+            wd8 = _int8_t((mlp.down_proj,), w_d, cs_d)
+            q8 = torch.empty((n, 2 * inter), dtype=torch.int8, device=x.device)
+            sq = torch.empty(n, dtype=torch.float32, device=x.device)
+            for r0, r1 in _chunks(n):
+                acc = torch._int_mm(dh8[r0:r1], wd8.t())
+                gate_up_act_bwd_i8_kernel[(r1 - r0,)](acc, sdh[r0:r1], cs_d, gu[r0:r1],
+                                                      q8[r0:r1], sq[r0:r1], INTER=inter,
+                                                      BLOCK=ACT_BLOCK)
+                sample_memory("layer backward", x.device)
+                del acc
+            del dh8, sdh, wd8, gu
+            wgu8 = _int8_t((mlp.gate_proj, mlp.up_proj), w_gu, cs_gu)
+            acc = torch._int_mm(q8, wgu8.t())
+            del q8, wgu8
+            dy2 = torch.mul(acc, sq[:, None]).mul_(cs_gu).to(dtype)
+            del acc, sq
         else:
-            w_half = _dequant((mlp.gate_proj,), dtype, w_gu[0:1] if w_gu else None)
-            dy2 = torch.mm(d_gu[:, :inter], w_half)
-            del w_half
-            w_half = _dequant((mlp.up_proj,), dtype, w_gu[1:2] if w_gu else None)
-            dy2.addmm_(d_gu[:, inter:], w_half)
-            del w_half
-        sample_memory("layer backward", x.device)
-        del d_gu, w_gu_full
+            d_act = torch.mm(dh2.to(dtype), _dequant((mlp.down_proj,), dtype, w_d))
+            # the gradient of gate|up overwrites gate|up (each element is read, then written)
+            gate_up_act_bwd_kernel[(n, triton.cdiv(inter, ACT_BLOCK))](d_act, gu, gu, inter,
+                                                                       BLOCK=ACT_BLOCK)
+            d_gu = gu
+            del d_act, gu
+            # dy2 = d_gate @ W_gate + d_up @ W_up: one weight dequantized at a time
+            if w_gu_full is not None:
+                w_gate, w_up = w_gu_full[:inter], w_gu_full[inter:]
+                dy2 = torch.mm(d_gu[:, :inter], w_gate)
+                dy2.addmm_(d_gu[:, inter:], w_up)
+                del w_gate, w_up
+            else:
+                w_half = _dequant((mlp.gate_proj,), dtype, w_gu[0:1] if w_gu else None)
+                dy2 = torch.mm(d_gu[:, :inter], w_half)
+                del w_half
+                w_half = _dequant((mlp.up_proj,), dtype, w_gu[1:2] if w_gu else None)
+                dy2.addmm_(d_gu[:, inter:], w_half)
+                del w_half
+            sample_memory("layer backward", x.device)
+            del d_gu, w_gu_full
         dh1 = _norm_bwd(dy2, None, None, None, x, o16, norm2.weight, rstd2, dh2,
                         1.0, 1.0)
         del dy2, o16
@@ -848,6 +1142,20 @@ def eligible_cached(layer, on_cuda):
     return hit[1] and (on_cuda or _ALLOW_CPU)
 
 
+_INT8_ELIGIBLE = {}
+
+
+def int8_eligible_cached(layer):
+    hit = _INT8_ELIGIBLE.get(id(layer))
+    if hit is None or hit[0] is not layer:
+        try:
+            ok = int8_eligible(layer)
+        except Exception:  # noqa: BLE001
+            ok = False
+        hit = _INT8_ELIGIBLE[id(layer)] = (layer, ok)
+    return hit[1]
+
+
 def eligible(layer):
     """The fused path covers this run's layer: q and v with one plain LoRA adapter on frozen
     NF4 weights, k, o, gate, up, down frozen NF4 without LoRA, SiLU, SDPA attention, no
@@ -919,6 +1227,7 @@ def run_layer(layer, hidden, u, cos, sin, recompute_mlp, index=0, weights=None, 
     spec.layer, spec.u, spec.cos, spec.sin = layer, u, cos, sin
     spec.dtype, spec.recompute_mlp = dtype, recompute_mlp
     spec.index, spec.weights, spec.store, spec.last = index, weights, store, last
+    spec.int8 = INT8 and STATE["int8"] and hidden.shape[0] > 16 and int8_eligible_cached(layer)
     qp, vp = attn.q_proj, attn.v_proj
     with torch.autocast(hidden.device.type, enabled=False):
         return FusedDecoderLayer.apply(hidden, qp.lora_A["default"].weight,
@@ -931,7 +1240,8 @@ def run_layer(layer, hidden, u, cos, sin, recompute_mlp, index=0, weights=None, 
 # What the fused path runs with, settled once by verify_first_layer():
 # attention "varlen" (one memory-efficient call with cu_seqlens) or "fallback" (SDPA row by row),
 # saved activations in host memory or not, weights streamed from host memory or fetched per use.
-STATE = {"verified": False, "use_fused": True, "attn": None, "store": True, "stream": True}
+STATE = {"verified": False, "use_fused": True, "attn": None, "store": True, "stream": True,
+         "int8": True}
 VERIFY_TOKENS = 384  # the self-check runs on the first tokens of the first batch (a few MB)
 
 
@@ -1092,18 +1402,28 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
         # error in the q gradient shows as 3e-1).
         allowed = {"output": 1e-2, "input grad": 2.5e-1, "lora_A q": 1.2e-1, "lora_B q": 1.2e-1,
                    "lora_A v": 3e-2, "lora_B v": 3e-2}
+        # With int8 gate|up and int8 MLP input gradients the layer is further from fp32 by the
+        # rounding of 8-bit operands (about 0.4 % of a row's largest value each): allowed about
+        # twice the fp16 path's limits. A wrong int8 kernel is off by far more.
+        allowed8 = {"output": 2.5e-2, "input grad": 3e-1, "lora_A q": 1.5e-1, "lora_B q": 1.5e-1,
+                    "lora_A v": 6e-2, "lora_B v": 6e-2}
 
         configs = []
+        if INT8 and int8_eligible_cached(layer) and m > 16:
+            configs.append(("varlen" if varlen_ok else "fallback", store is not None,
+                            weights is not None, True))
         for mode in (["varlen"] if varlen_ok else []) + ["fallback"]:
             for keep_host in ([True, False] if store is not None else [False]):
-                configs.append((mode, keep_host, weights is not None))
+                configs.append((mode, keep_host, weights is not None, False))
         if weights is not None:
-            configs.append(("fallback", False, False))
+            configs.append(("fallback", False, False, False))
         chosen = None
-        for mode, keep_host, stream in configs:
+        for mode, keep_host, stream, int8 in configs:
             name = f"{mode} attention, activations {'host' if keep_host else 'GPU'}, " \
-                   f"weights {'streamed' if stream else 'fetched'}"
+                   f"weights {'streamed' if stream else 'fetched'}" + (", int8 MLP" if int8 else "")
+            limits = allowed8 if int8 else allowed
             try:
+                STATE["int8"] = int8
                 _Attention.mode = mode
                 sub.handles = {}
                 if keep_host:
@@ -1116,30 +1436,33 @@ def verify_first_layer(layer, x, u, cos, sin, weights, store):
                 grads = torch.autograd.grad(out, [xin] + params, grad)
                 errs = _errors(out.detach(), grads, truth, truth_grads, xin, grad)
                 del out, grads
-                bad = [k for k in errs if not errs[k] <= allowed[k]]
+                bad = [k for k in errs if not errs[k] <= limits[k]]
                 log.append(f"fused ({name}) " + ", ".join(f"{k} {v:.1e}" for k, v in errs.items())
                            + (f" -> differs: {', '.join(bad)}" if bad else " -> ok"))
                 if not bad:
-                    chosen = (mode, keep_host, stream)
+                    chosen = (mode, keep_host, stream, int8)
                     break
             except Exception as exc:  # noqa: BLE001
                 log.append(f"fused ({name}) failed: {exc!r}")
         if chosen is None:
             STATE["use_fused"] = False
+            STATE["int8"] = False
             _Attention.mode = "varlen" if varlen_ok else "fallback"
             log.append("no fused configuration matched: per-module path")
         else:
-            STATE["attn"], STATE["store"], STATE["stream"] = chosen
+            STATE["attn"], STATE["store"], STATE["stream"], STATE["int8"] = chosen
             _Attention.mode = chosen[0]
             log.append(f"fused path: {chosen[0]} attention, activations "
                        f"{'in host memory' if chosen[1] else 'on the GPU'}, weights "
-                       f"{'streamed' if chosen[2] else 'fetched per use'}")
+                       f"{'streamed' if chosen[2] else 'fetched per use'}, MLP GEMMs "
+                       f"{'int8' if chosen[3] else 'fp16'}")
     except Exception as exc:  # noqa: BLE001
         import traceback
 
         traceback.print_exc()
         log.append(f"self-check failed ({exc!r}): per-module path")
         STATE["use_fused"] = False
+        STATE["int8"] = False
     finally:
         unpad._LOCAL.ctx = saved_ctx
         torch.cuda.set_rng_state(state, device)

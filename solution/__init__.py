@@ -8,7 +8,8 @@ before Soup builds the model and the trainer.
 - `rmsnorm.py`   RMSNorm forward and backward in one kernel each, with the fp16 copy those
                  layers need
 - `layer.py`     a whole decoder layer as one autograd function: fused q|k|v and gate|up GEMMs,
-                 LoRA inside, variable-length attention, hand-written backward pass
+                 LoRA inside, variable-length attention, hand-written backward pass; gate|up and
+                 the MLP's input gradients as int8 tensor-core GEMMs on int8 weights made from NF4
 - `unpad.py`     the decoder on real tokens only (padding removed inside the batch)
 - `embed.py`     one exact fp16 copy of the tied embedding / head instead of fp32 + fp16
 - `warmup.py`    our kernels compile while the model loads, not in the first step

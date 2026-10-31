@@ -29,6 +29,7 @@ def _compile_all():
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
     f16, f32, i64 = torch.float16, torch.float32, torch.int64
+    i32, i8, u8 = torch.int32, torch.int8, torch.uint8
 
     def t(n, dtype):
         return torch.zeros(n, dtype=dtype, device=dev)
@@ -74,6 +75,24 @@ def _compile_all():
             t(2 * I, f16), t(I, f16), I, BLOCK=layer.ACT_BLOCK),
         lambda: layer.gate_up_act_bwd_kernel[(1, 1)](
             t(I, f16), t(2 * I, f16), t(2 * I, f16), I, BLOCK=layer.ACT_BLOCK),
+        # the int8 MLP GEMMs (layer.py): weights, activations, epilogues, and cuBLASLt's int8 GEMM
+        lambda: layer.nf4_int8_rows_kernel[(1,)](
+            t(H // 2, u8), t(H // 64, f32), t(H // 2, u8), t(H // 64, f32), t(16, f32),
+            t(H, i8), t(1, f32), I, H, QBLOCK=64, BLOCK=2048),
+        lambda: layer.nf4_int8_t_kernel[(1, 1)](
+            t(64 * H // 2, u8), t(64 * H // 64, f32), t(64 * H // 2, u8), t(64 * H // 64, f32),
+            t(16, f32), t(128, f32), t(128 * 1024, i8), 1024, 1024, H, QBLOCK=64, BN=64, BK=128),
+        lambda: layer.row_quant_kernel[(1,)](t(H, f16), t(H, i8), t(1, f32), H, BLOCK=2048,
+                                             num_warps=4),
+        lambda: layer.row_quant_kernel[(1,)](t(H, f32), t(H, i8), t(1, f32), H, BLOCK=2048,
+                                             num_warps=4),
+        lambda: layer.gate_up_act_fwd_i8_kernel[(1, 1)](
+            t(2 * I, i32), t(1, f32), t(2 * I, f32), t(2 * I, f16), t(I, f16), I,
+            BLOCK=layer.ACT_BLOCK),
+        lambda: layer.gate_up_act_bwd_i8_kernel[(1,)](
+            t(I, i32), t(1, f32), t(I, f32), t(2 * I, f16), t(2 * I, i8), t(1, f32), INTER=I,
+            BLOCK=layer.ACT_BLOCK),
+        lambda: torch._int_mm(t(32 * 64, i8).view(32, 64), t(64 * 32, i8).view(32, 64).t()),
         # the head and loss (fused_ce.py) and the final norm (rmsnorm.py)
         lambda: None if offload.ENABLED and offload.HEAD else fused_ce.ce_row_stats_kernel.warmup(
             t(VOCAB, f16), VOCAB, 0, t(1, i64), t(1, f32), t(1, f32),

@@ -320,6 +320,41 @@ def test_fused_layer_matches_stock_modules(offloaded):
         assert (grads1[name] - g).abs().max().item() <= 3e-2 * scale, name
 
 
+def test_int8_weights_and_activations():
+    """layer.py's int8 operands: the NF4 weight to int8 (per-row scales, and transposed with
+    per-column scales), a row to int8, and torch._int_mm on them against fp32 GEMMs."""
+    import bitsandbytes.functional as bnb_f
+
+    import solution.layer as layer
+
+    class Fake:  # what _int8_rows / _int8_t read from a Linear4bit
+        def __init__(self, packed, state):
+            self.weight = packed
+            self.weight.quant_state = state
+
+    rows, cols = 512, 1536
+    (p0, s0), (p1, s1) = _quantized(rows, cols, 1), _quantized(rows, cols, 2)
+    w = torch.cat([bnb_f.dequantize_4bit(p0, s0), bnb_f.dequantize_4bit(p1, s1)]).float()
+    gate, up = Fake(p0, s0), Fake(p1, s1)
+    q, s = layer._int8_rows((gate, up), None)
+    torch.testing.assert_close(s, w.abs().amax(1) / 127, rtol=1e-3, atol=0)
+    assert (q.float() * s[:, None] - w).abs().max() <= 0.6 * s.max()
+    cs = w.abs().amax(0) / 127
+    qt = layer._int8_t((gate, up), None, cs)
+    assert qt.shape == (cols, 2 * rows)
+    assert (qt.float().t() * cs[None, :] - w).abs().max() <= 0.6 * cs.max()
+    x = torch.randn(300, cols, device="cuda").half()
+    x8, sx = layer._row_quant(x)
+    y = torch._int_mm(x8, q.t()).float() * sx[:, None] * s[None, :]
+    ref = x.float() @ w.t()
+    assert (y - ref).abs().max() <= 2e-2 * ref.abs().max()
+    dy = torch.randn(300, 2 * rows, device="cuda")
+    d8, sd = layer._row_quant(dy)
+    dx = torch._int_mm(d8, qt.t()).float() * sd[:, None] * cs[None, :]
+    ref = dy @ w
+    assert (dx - ref).abs().max() <= 2e-2 * ref.abs().max()
+
+
 # --- head_stream.py ---------------------------------------------------------------------------
 
 def test_streamed_head_matches_resident():
