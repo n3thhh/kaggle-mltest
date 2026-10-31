@@ -766,7 +766,7 @@ KEPT_BYTES_PER_TOKEN_LAYER = 9 * 1024 + 128
 # gate|up goes to host memory in every layer (measured on the T4: 6 % faster steps than
 # recomputing it in one layer out of three, at the same memory peak). N > 1: recomputed in one
 # layer out of N; 0: always recomputed.
-MLP_HOST_PERIOD = int(__import__("os").environ.get("SOUP_SOLUTION_MLP_HOST_PERIOD", "1"))
+MLP_HOST_PERIOD = 1
 
 
 def mlp_to_host(index):
@@ -790,10 +790,7 @@ def mlp_layers_to_recompute(n_tokens, n_layers, inter, offloaded=False):
     """How many layers (the first ones) recompute gate|up in this step. With the other saved
     tensors in host memory (offload.py) only gate|up count against the budget, and the default
     budget is 0: every layer recomputes, and a step keeps almost nothing on the GPU."""
-    import os
-
-    default = OFFLOAD_ACT_BUDGET_MB if offloaded else ACT_BUDGET_MB
-    budget = float(os.environ.get("SOUP_SOLUTION_ACT_BUDGET_MB", default))
+    budget = OFFLOAD_ACT_BUDGET_MB if offloaded else ACT_BUDGET_MB
     per_layer = n_tokens * 4 * inter / 2**20
     kept = 0 if offloaded else n_tokens * KEPT_BYTES_PER_TOKEN_LAYER * n_layers / 2**20
     room = budget - kept

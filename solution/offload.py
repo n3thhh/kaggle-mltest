@@ -16,14 +16,13 @@ Everything is copied, not changed: the bytes the GPU computes with are the bytes
 kept. The copies cost PCIe time, which overlaps compute on the T4's separate copy engines.
 """
 
-import os
 import threading
 
 import torch
 
-ENABLED = os.environ.get("SOUP_SOLUTION_OFFLOAD", "1") == "1"
-ACTIVATIONS = os.environ.get("SOUP_SOLUTION_OFFLOAD_ACTS", "1") == "1"
-HEAD = os.environ.get("SOUP_SOLUTION_OFFLOAD_HEAD", "1") == "1"
+ENABLED = True      # 4-bit weights in host memory
+ACTIVATIONS = True  # saved activations in host memory
+HEAD = True         # tied embedding / head in host memory
 
 
 class HostArena:

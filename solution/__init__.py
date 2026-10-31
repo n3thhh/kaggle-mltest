@@ -15,6 +15,8 @@ before Soup builds the model and the trainer.
 - `rope.py`      rotary embedding + fp16 cast + k/v expansion for attention, one kernel each way
 - `mlp.py`       in long batches the MLP keeps only its fp16 input and recomputes gate/up
 - `imports.py`   TRL reuses transformers' package-metadata scan instead of a second one
+- `optional_imports.py` scikit-learn and wandb (unused here) not imported by transformers / TRL
+- `dataset_name.py` Soup's tokenization map named at random instead of by hashing the tokenizer
 - `offload.py`   4-bit weights and saved activations in pinned host memory, streamed per layer
 - `head_stream.py` the tied embedding / head in pinned host memory: loss over vocabulary chunks
 - `swiglu.py`    the organizers' example (fused SwiGLU), kept running; it does not count as ours
@@ -22,28 +24,22 @@ before Soup builds the model and the trainer.
 """
 
 import sys
+import time
 
 from .swiglu import patch_qwen2_mlp
 
 
+_T0 = time.perf_counter()  # when solution/ was imported (the harness imports it right before apply())
+
+
 def since_start():
-    """Seconds since this process started (for the timeline lines in the log)."""
-    try:
-        import os
-
-        ticks = os.sysconf("SC_CLK_TCK")
-        start = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19]) / ticks
-        boot = next(float(line.split()[1]) for line in open("/proc/stat")
-                    if line.startswith("btime"))
-        import time
-
-        return time.time() - boot - start
-    except Exception:  # noqa: BLE001
-        return float("nan")
+    """Seconds since solution/ was imported (for the timeline lines in the log)."""
+    return time.perf_counter() - _T0
 
 
 def mark(what):
-    print(f"[solution] t={since_start():6.2f} s  {what}", file=sys.stderr, flush=True)
+    print(f"[solution] t+{since_start():6.2f} s since import  {what}", file=sys.stderr,
+          flush=True)
 
 
 def _try(name, patch):
@@ -58,9 +54,18 @@ def apply():
     from .warmup import start
 
     _try("kernel warm-up", start)  # first: our kernels compile while everything else loads
+    from .optional_imports import (import_candidate_generator_without_sklearn,
+                                   import_trl_base_trainer_without_wandb)
+
+    _try("assisted-generation helpers without scikit-learn",
+         import_candidate_generator_without_sklearn)  # before anything imports generation
     from .imports import import_trl
 
     _try("one package-metadata scan", import_trl)  # before anything of ours imports TRL
+    _try("TRL's base trainer without wandb", import_trl_base_trainer_without_wandb)
+    from .dataset_name import patch_soup_text_map
+
+    _try("Soup's tokenization map without hashing the tokenizer", patch_soup_text_map)
     from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
     from .nf4 import patch_bnb_matmul_4bit, patch_linear4bit
     from .rmsnorm import patch_qwen2_rmsnorm

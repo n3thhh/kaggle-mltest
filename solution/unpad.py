@@ -249,7 +249,10 @@ def patch_qwen2_model():
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
         n_real = rows.numel()  # one sync, as TRL's own .item() calls on the mask
         _MAX_TOKENS[0] = max(_MAX_TOKENS[0], n_real)
-        if n_real == batch * seq or n_real == 0:
+        # A batch without padding (every row the same length, e.g. all truncated to max_length)
+        # still goes through the fused layers: the per-module path would keep the MLP's
+        # gate/up for every layer and fetch the offloaded weights one use at a time.
+        if n_real == 0:
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)

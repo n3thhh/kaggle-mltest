@@ -304,14 +304,14 @@ def _plain_head(h, w, targets, k, grad_scale):
 
 
 def verify(weight, host, device, hidden, grad_scale):
-    """Once, at the first step: the streamed head against plain fp32 PyTorch on the first 8,192
-    vocabulary rows (two chunks of 4,096, so the slot logic runs) and up to 64 of the step's
+    """Once, at the first step: the streamed head against plain fp32 PyTorch on the first 16,384
+    vocabulary rows (two chunks of the training size, so the slot logic runs) and up to 64 of the step's
     tokens. Any difference, or any error, and the weight goes back to the GPU for good."""
     import sys
 
     VERIFIED["done"] = True
     try:
-        sub = min(8192, host.shape[0])
+        sub = min(2 * CHUNK, host.shape[0])  # two chunks of the training size: no new variant
         gen = torch.Generator(device=device)
         gen.manual_seed(99)
         h = hidden[: min(64, hidden.shape[0])].contiguous()
@@ -320,7 +320,7 @@ def verify(weight, host, device, hidden, grad_scale):
         k = h.shape[0] // 2
         resident = host[:sub].to(device)
         ref = _plain_head(h, resident, targets, k, grad_scale)
-        got = rows_through_streamed_head(h, HeadStream(host[:sub], device, chunk=sub // 2),
+        got = rows_through_streamed_head(h, HeadStream(host[:sub], device, chunk=CHUNK),
                                          targets, True, k, grad_scale)
         del resident
         errors = []
